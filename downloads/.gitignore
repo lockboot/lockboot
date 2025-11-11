@@ -1,0 +1,5 @@
+*.apk
+*.rpm
+x86_64
+aarch64
+*-linux-*

@@ -1,0 +1,31 @@
+FROM busybox:1.36 AS builder
+
+# Docker buildx automatically sets TARGETARCH (amd64 or arm64)
+ARG TARGETARCH
+
+# Map Docker's TARGETARCH to our directory structure
+# Create symlinks to map amd64->x86_64 and arm64->aarch64
+COPY x86_64/ /binaries/x86_64/
+COPY aarch64/ /binaries/aarch64/
+
+# Create arch-specific directory based on TARGETARCH
+RUN mkdir -p /target && \
+    if [ "$TARGETARCH" = "amd64" ]; then \
+        cp /binaries/x86_64/busybox /binaries/x86_64/bubblewrap /binaries/x86_64/stage1 /target/; \
+    elif [ "$TARGETARCH" = "arm64" ]; then \
+        cp /binaries/aarch64/busybox /binaries/aarch64/bubblewrap /binaries/aarch64/stage1 /target/; \
+    else \
+        echo "Unsupported architecture: $TARGETARCH" && exit 1; \
+    fi
+
+RUN chmod 755 /target/*
+
+FROM scratch
+
+# Copy the binaries from the builder stage
+COPY --from=builder /target/busybox /bin/busybox
+COPY --from=builder /target/bubblewrap /bin/bwrap
+COPY --from=builder /target/stage1 /bin/stage1
+
+# Set the entrypoint to busybox shell
+ENTRYPOINT ["/bin/stage1"]

@@ -1,0 +1,46 @@
+#!/bin/busybox sh
+set -xe
+BB=/bin/busybox
+# Mount essential filesystems
+$BB mount -t proc none /proc
+$BB mount -t sysfs none /sys
+$BB mount -t devtmpfs none /dev
+$BB mount -t tmpfs none /tmp
+
+$BB modprobe efivarfs
+$BB mount -t efivarfs none /sys/firmware/efi/efivars
+
+# Load hardware RNG modules
+$BB modprobe rng-core
+$BB modprobe intel-rng 2>/dev/null || true
+$BB modprobe amd-rng 2>/dev/null || true
+
+$BB modprobe failover
+$BB modprobe net_failover
+$BB modprobe virtio_pci
+$BB modprobe virtio_net
+$BB modprobe ena
+$BB modprobe vsock
+$BB modprobe vhost
+$BB modprobe vhost_vsock
+$BB modprobe nitro_enclaves
+
+$BB ip link set lo up
+# Find first non-loopback interface
+ETH_IFACE=$($BB ip link show | $BB grep -v loopback | $BB grep -v 'lo:' | $BB head -1 | $BB awk '{print $2}' | $BB sed 's/://')
+if [ -n "$ETH_IFACE" ]; then
+	$BB ip link set "$ETH_IFACE" up
+	$BB udhcpc -i "$ETH_IFACE" -n -s /bin/udhcpc.script
+else
+	echo "[ERROR] No network interface found"
+    $BB poweroff -f
+    exit
+fi
+
+exec /bin/stage1
+
+# Shutdown
+echo "[ERROR] Failed to run stage1"
+$BB sleep 2
+$BB poweroff -f
+exit

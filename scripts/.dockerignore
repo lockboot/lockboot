@@ -1,0 +1,13 @@
+output/
+*.efi
+*.img
+.git/
+.gitignore
+README.md
+*.rpm
+stage1
+busybox
+ec2-metadata-mock-*
+bubblewrap
+secure-boot-keys
+old

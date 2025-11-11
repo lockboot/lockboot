@@ -1,0 +1,31 @@
+[build]
+# Default to musl for static linking
+target = "x86_64-unknown-linux-musl"
+
+[target.x86_64-unknown-linux-musl]
+# Rustc will use its bundled musl for linking
+# Ensure fully static linking
+# Use rust-lld linker (no system cc needed)
+rustflags = [
+    "-C", "linker=rust-lld",
+    "-C", "target-feature=+crt-static",
+    "-C", "link-arg=-static",
+]
+
+[target.x86_64-unknown-linux-gnu]
+# Host target for proc-macros and build scripts - also use rust-lld
+rustflags = ["-C", "linker=rust-lld"]
+
+[target.aarch64-unknown-linux-musl]
+# Rustc will use its bundled musl for linking
+# Ensure fully static linking
+# Use rust-lld linker (no system cc needed)
+rustflags = [
+    "-C", "linker=rust-lld",
+    "-C", "target-feature=+crt-static",
+    "-C", "link-arg=-static",
+]
+
+[env]
+# Set SOURCE_DATE_EPOCH for reproducible builds
+SOURCE_DATE_EPOCH = "0"

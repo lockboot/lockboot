@@ -1,0 +1,30 @@
+FROM lockboot:build
+
+# Install development tools and Claude Code
+RUN DEBIAN_FRONTEND=noninteractive apt-get -qq update && \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y \
+    docker.io \
+    qemu-system-x86 \
+    qemu-system-arm \
+    git \
+    vim \
+    build-essential \
+    gpg \
+    iptables \
+    iproute2 \
+    dnsmasq \
+    swtpm     
+
+# Install Claude Code
+#RUN curl -fsSL https://claude.ai/install.sh | bash
+# Download the Claude Code binary manually
+ENV CLAUDE_CODE_URL=https://storage.googleapis.com/claude-code-dist-86c565f3-f756-42ad-8dfa-d59b1c096819
+RUN ARCH=$(uname -m | sed 's/x86_64/x64/; s/aarch64/arm64/') && \
+    wget -O claude-version ${CLAUDE_CODE_URL}/claude-code-releases/stable && \
+    VERSION=$(cat claude-version) && \
+    wget -O /usr/local/bin/claude "${CLAUDE_CODE_URL}/claude-code-releases/${VERSION}/linux-${ARCH}/claude" && \
+    chmod +x /usr/local/bin/claude
+ENV DISABLE_AUTOUPDATER=1
+
+# Development environment - keep same reproducible build settings from base
+WORKDIR /src

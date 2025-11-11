@@ -1,0 +1,47 @@
+FROM rust:1.91-slim-bookworm
+
+# Add musl targets for both architectures
+RUN rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
+
+# Install tools needed for UKI building
+RUN apt-get -qq update && \
+    apt-get install -y \
+    binutils \
+    binutils-aarch64-linux-gnu \
+    binutils-x86-64-linux-gnu \
+    gcc \
+    gcc-aarch64-linux-gnu \
+    qemu-efi-aarch64 \
+    kmod \
+    cpio \
+    gzip \
+    findutils \
+    dosfstools \
+    fdisk \
+    gdisk \
+    util-linux \
+    python3 \
+    python3-pip \
+    rpm2cpio \
+    sbsigntool \
+    efitools \
+    uuid-runtime \
+    musl-tools \
+    ovmf \
+    wget \
+    curl \
+    make && \
+    pip3 install --break-system-packages virt-firmware
+
+# Reproducible builds environment
+ENV SOURCE_DATE_EPOCH=0
+ENV CARGO_INCREMENTAL=0
+ENV RUSTFLAGS="-C linker=rust-lld -C target-feature=+crt-static -C link-arg=-static"
+
+# User environment (project-specific cargo/rustup data)
+ENV HOME=/src
+ENV CARGO_HOME=/src/.cargo
+ENV RUSTUP_HOME=/src/.rustup
+ENV HISTFILE=/dev/null
+
+WORKDIR /src

@@ -1,0 +1,12 @@
+[package]
+name = "example-stage2"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+
+[dependencies]
+libc = { workspace = true }
+
+[[bin]]
+name = "example-stage2"
+path = "src/main.rs"
