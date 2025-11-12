@@ -6,7 +6,7 @@ A secure two-stage boot system using the TPM (and AWS Nitro, if available) for v
 - **Verified Boot**: SHA256 validation with TPM PCR measurements (PCR 14: binary, PCR 15: config)
 - **Attestation**: Pre-execution TPM attestation documents for remote verification
 - **Multi-Architecture**: Native support for x86_64 and aarch64
-- **Secure Boot**: UEFI Secure Boot compatible (DeployedMode=1)
+- **Secure Boot**: UEFI Secure Boot signed and locked (DeployedMode=1)
 
 ## Quick Start
 
@@ -48,13 +48,13 @@ Deploy the same config across AWS, GCP, or Azure:
 
 ```bash
 # AWS
-aws ec2 run-instances --user-data file://config.json --tpm-support v2.0 ...
+aws ec2 run-instances --user-data file://user-data.json --tpm-support v2.0 ...
 
 # GCP
-gcloud compute instances create --metadata user-data="$(cat config.json)" ...
+gcloud compute instances create --metadata user-data="$(cat user-data.json)" ...
 
 # Azure
-az vm create --user-data "$(cat config.json | base64 -w0)" ...
+az vm create --user-data "$(cat user-data.json | base64 -w0)" ...
 ```
 
 ## License

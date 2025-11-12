@@ -133,6 +133,7 @@ REQUIRED_MODULES=(
     "drivers/vhost/vhost_vsock.ko"
 
     # Nitro Enclaves
+    "drivers/misc/nsm.ko"
     "drivers/virt/nitro_enclaves/nitro_enclaves.ko"
 )
 

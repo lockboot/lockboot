@@ -4,8 +4,13 @@ on:
   push:
     tags:
       - 'v*'
-  pull_request:
-    branches: [ main ]
+  workflow_dispatch:
+    inputs:
+      release-docker:
+        description: 'Build and push Docker image'
+        type: boolean
+        required: false
+        default: false
 
 jobs:
   build:
@@ -33,11 +38,10 @@ jobs:
             ${{ matrix.arch }}/os-release
             ${{ matrix.arch }}/efi-vars.*
   
-  release:
+  release-docker:
     runs-on: ubuntu-latest
     needs: build
-    # Only run if build succeeded and it was triggered by a tag
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: inputs.release-docker
     permissions:
       contents: write
       packages: write
@@ -48,35 +52,17 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
 
-      - name: Download artifact zips directly via API
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          # Get artifact IDs from the current workflow run
-          ARTIFACTS=$(gh api repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/artifacts)
-
-          # Download x86_64 artifact zip
-          X86_64_ID=$(echo "$ARTIFACTS" | jq -r '.artifacts[] | select(.name=="x86_64") | .id')
-          gh api repos/${{ github.repository }}/actions/artifacts/${X86_64_ID}/zip > x86_64.zip
-
-          # Download aarch64 artifact zip
-          AARCH64_ID=$(echo "$ARTIFACTS" | jq -r '.artifacts[] | select(.name=="aarch64") | .id')
-          gh api repos/${{ github.repository }}/actions/artifacts/${AARCH64_ID}/zip > aarch64.zip
-
-      - name: Extract artifacts for Docker build
-        run: |
-          unzip -q x86_64.zip -d x86_64
-          unzip -q aarch64.zip -d aarch64
-
-      - name: Attest x86_64 zip
-        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3.0.0
+      - name: Download x86_64 artifacts
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
         with:
-          subject-path: 'x86_64.zip'
+          name: x86_64
+          path: x86_64
 
-      - name: Attest aarch64 zip
-        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3.0.0
+      - name: Download aarch64 artifacts
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
         with:
-          subject-path: 'aarch64.zip'
+          name: aarch64
+          path: aarch64
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@c47758b77c9736f4b2ef4073d4d51994fabfe349 # v3.7.1
@@ -118,6 +104,50 @@ jobs:
           subject-name: ghcr.io/${{ github.repository }}
           subject-digest: ${{ steps.push.outputs.digest }}
           push-to-registry: true
+
+  release-zip:
+    runs-on: ubuntu-latest
+    needs: build
+    # Only run if build succeeded and it was triggered by a tag
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+
+      - name: Download artifact zips directly via API
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ARTIFACTS=$(gh api repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/artifacts)
+          for arch in x86_64 aarch64; do
+            ARTIFACT_ID=$(echo "$ARTIFACTS" | jq -r ".artifacts[] | select(.name==\"$arch\") | .id")
+            gh api repos/${{ github.repository }}/actions/artifacts/${ARTIFACT_ID}/zip > ${arch}.zip
+          done
+
+      - name: Attest x86_64 zip
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3.0.0
+        with:
+          subject-path: 'x86_64.zip'
+
+      - name: Attest aarch64 zip
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3.0.0
+        with:
+          subject-path: 'aarch64.zip'
+
+      - name: Extract metadata for Docker
+        id: meta
+        uses: docker/metadata-action@8e5442c4ef9f78752691e2d8f8d19755c6f78e81 # v5.5.1
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=ref,event=tag
+          flavor: |
+            latest=auto
 
       - name: Create Release
         uses: softprops/action-gh-release@5be0e66d93ac7ed76da52eca8bb058f665c3a5fe # v2.4.2
