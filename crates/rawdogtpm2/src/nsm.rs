@@ -55,19 +55,19 @@ pub enum ErrorCode {
 
 impl Request {
     pub fn to_bytes(&self) -> Result<Vec<u8>> {
-        serde_cbor::to_vec(self)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize NSM request: {}", e))
+        let mut buf = Vec::new();
+        ciborium::into_writer(self, &mut buf)
+            .map_err(|e| anyhow::anyhow!("Failed to serialize NSM request: {}", e))?;
+        Ok(buf)
     }
 }
 
 impl Response {
     pub fn from_bytes(data: &[u8]) -> Result<Self> {
-        use serde::Deserialize;
-        let mut deserializer = serde_cbor::Deserializer::from_slice(data);
-        let response = Response::deserialize(&mut deserializer)
-            .map_err(|e| anyhow::anyhow!("Failed to deserialize NSM response: {}", e))?;
-        // Don't check for trailing data - NV index has 0xFF padding
-        Ok(response)
+        // ciborium::from_reader handles trailing bytes (0xFF padding) gracefully -
+        // it stops after parsing one complete CBOR object
+        ciborium::from_reader(data)
+            .map_err(|e| anyhow::anyhow!("Failed to deserialize NSM response: {}", e))
     }
 }
 

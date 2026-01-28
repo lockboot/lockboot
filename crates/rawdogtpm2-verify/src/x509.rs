@@ -2,6 +2,7 @@
 
 //! X.509 certificate handling
 
+use base64::{engine::general_purpose::STANDARD, Engine as _};
 use der::Decode;
 use ecdsa::signature::hazmat::PrehashVerifier;
 use sha2::{Digest, Sha256};
@@ -42,46 +43,11 @@ pub fn parse_cert_chain_pem(pem: &str) -> Result<Vec<Certificate>, VerifyError> 
     Ok(certs)
 }
 
-/// Simple base64 decoder
-pub(crate) fn base64_decode(input: &str) -> Result<Vec<u8>, VerifyError> {
-    use std::collections::HashMap;
-
-    let alphabet: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let decode_table: HashMap<u8, u8> = alphabet
-        .iter()
-        .enumerate()
-        .map(|(i, &c)| (c, i as u8))
-        .collect();
-
-    let input: Vec<u8> = input.bytes().filter(|&b| b != b'\n' && b != b'\r').collect();
-    let mut output = Vec::new();
-
-    for chunk in input.chunks(4) {
-        let mut buf = [0u8; 4];
-        let mut valid = 0;
-
-        for (i, &byte) in chunk.iter().enumerate() {
-            if byte == b'=' {
-                break;
-            }
-            buf[i] = *decode_table
-                .get(&byte)
-                .ok_or_else(|| VerifyError::CertificateParse("Invalid base64".into()))?;
-            valid += 1;
-        }
-
-        if valid >= 2 {
-            output.push((buf[0] << 2) | (buf[1] >> 4));
-        }
-        if valid >= 3 {
-            output.push((buf[1] << 4) | (buf[2] >> 2));
-        }
-        if valid >= 4 {
-            output.push((buf[2] << 6) | buf[3]);
-        }
-    }
-
-    Ok(output)
+/// Decode base64 string
+fn base64_decode(input: &str) -> Result<Vec<u8>, VerifyError> {
+    STANDARD
+        .decode(input)
+        .map_err(|e| VerifyError::CertificateParse(format!("Invalid base64: {}", e)))
 }
 
 /// Extract raw public key bytes from an X.509 certificate
@@ -199,7 +165,7 @@ mod tests {
     #[test]
     fn test_base64_decode() {
         let input = "SGVsbG8gV29ybGQ="; // "Hello World"
-        let decoded = base64_decode(input).unwrap();
+        let decoded = STANDARD.decode(input).unwrap();
         assert_eq!(decoded, b"Hello World");
     }
 }
