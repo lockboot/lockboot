@@ -6,7 +6,7 @@
 
 use anyhow::Result;
 use rawdogtpm2::{Tpm, TpmAlg, TPM_RH_OWNER, TPM_RH_ENDORSEMENT, NV_INDEX_RSA_2048_EK_CERT, NV_INDEX_ECC_P256_EK_CERT, NV_INDEX_ECC_P384_EK_CERT};
-use rawdogtpm2::{PcrOps, NvOps};
+use rawdogtpm2::{EkOps, PcrOps, NvOps};
 
 // TPM fixed property identifiers (TPM_PT)
 const TPM_PT_FAMILY_INDICATOR: u32 = 0x00000100;

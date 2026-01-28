@@ -10,14 +10,15 @@
 
 use anyhow::{anyhow, Context, Result};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, BTreeMap};
+use sha2::{Sha256, Digest};
 
-use crate::{Tpm, NvOps, PcrOps, NsmOps, TPM_RH_ENDORSEMENT, TPM_RH_OWNER};
+use crate::{Tpm, EkOps, NvOps, PcrOps, NsmOps, TPM_RH_OWNER};
 use crate::{NV_INDEX_RSA_2048_EK_CERT, NV_INDEX_ECC_P256_EK_CERT, NV_INDEX_ECC_P384_EK_CERT};
 
 /// Complete attestation output containing all TPM attestation data
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct AttestationOutput {
     pub ek_certificates: EkCertificates,
     pub pcrs: HashMap<String, BTreeMap<u8, String>>,
@@ -27,7 +28,7 @@ pub struct AttestationOutput {
 }
 
 /// Endorsement Key certificates in PEM format
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct EkCertificates {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rsa_2048: Option<String>,
@@ -38,14 +39,14 @@ pub struct EkCertificates {
 }
 
 /// ECC public key coordinates
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct EkPublicKey {
     pub x: String,
     pub y: String,
 }
 
 /// Container for both TPM and optional Nitro attestations
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct AttestationContainer {
     pub tpm: HashMap<String, AttestationData>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -53,14 +54,14 @@ pub struct AttestationContainer {
 }
 
 /// TPM attestation data (certify response)
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct AttestationData {
     pub attest_data: String,
     pub signature: String,
 }
 
 /// Nitro Enclave attestation data
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct NitroAttestationData {
     pub public_key: String,
     pub nonce: String,
@@ -83,10 +84,10 @@ fn der_to_pem(der: &[u8], label: &str) -> String {
 ///
 /// This function:
 /// 1. Retrieves EK certificates from NV RAM
-/// 2. Creates an EK and extracts its public key
+/// 2. Creates the TCG standard EK (matches certificate public key)
 /// 3. Reads all PCRs from all banks
 /// 4. Creates a signing key bound to current PCR values
-/// 5. Certifies the signing key with the EK
+/// 5. Has the signing key sign the nonce (proves PCR state + freshness)
 /// 6. If on AWS Nitro, generates a Nitro attestation document
 ///
 /// # Arguments
@@ -125,9 +126,11 @@ pub fn attest(nonce: &[u8]) -> Result<String> {
         }
     }
 
-    // Step 2: Create/access EK to get public key (P256 for now)
-    let ek = tpm.create_primary_ecc_key(TPM_RH_ENDORSEMENT)
-        .context("Failed to create EK - endorsement hierarchy may require authentication")?;
+    // Step 2: Create TCG standard EK (public key should match certificate)
+    // Note: Standard EK is decrypt-only, cannot sign. We use it only for
+    // identity verification (comparing public key with certificate).
+    let ek = tpm.create_standard_ek()
+        .context("Failed to create standard EK - endorsement hierarchy may require authentication")?;
 
     let mut ek_public_keys = HashMap::new();
     ek_public_keys.insert("ecc_p256".to_string(), EkPublicKey {
@@ -156,6 +159,7 @@ pub fn attest(nonce: &[u8]) -> Result<String> {
         .map(|(_, alg, _)| *alg)
         .ok_or_else(|| anyhow!("No PCRs found"))?;
 
+    // Create signing key (AK) bound to current PCR values
     let signing_key = tpm.create_primary_ecc_key_with_pcr_policy(TPM_RH_OWNER, &pcr_indices, bank_alg)?;
 
     let mut signing_key_public_keys = HashMap::new();
@@ -164,8 +168,18 @@ pub fn attest(nonce: &[u8]) -> Result<String> {
         y: hex::encode(&signing_key.public_key.y),
     });
 
-    // Step 5: Certify the signing key with the EK
-    let cert_result = tpm.certify(signing_key.handle, ek.handle, nonce)?;
+    // Step 5: Sign the nonce with the signing key (AK)
+    // The AK can only sign when PCRs match its policy, proving the PCR state.
+    // We sign the SHA-256 hash of the nonce (TPM expects 32-byte digest for signing)
+    let nonce_digest = Sha256::digest(nonce);
+    let signature = tpm.sign(signing_key.handle, &nonce_digest)?;
+
+    // Build attestation data - we include the nonce as the "attest_data"
+    // and the signature over its hash as the "signature"
+    let cert_result = crate::CertifyResult {
+        attest_data: nonce.to_vec(),
+        signature,
+    };
 
     let attestation_data = AttestationData {
         attest_data: hex::encode(&cert_result.attest_data),

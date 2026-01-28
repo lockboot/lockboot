@@ -1,0 +1,34 @@
+[package]
+name = "rawdogtpm2-verify"
+version = "0.1.0"
+edition = "2021"
+description = "Attestation verification for TPM and Nitro attestations"
+license.workspace = true
+
+[dependencies]
+rawdogtpm2 = { path = "../rawdogtpm2" }
+
+# X.509 parsing
+der = { workspace = true }
+spki = { workspace = true }
+x509-cert = { workspace = true }
+
+# Signature verification
+p256 = { workspace = true }
+p384 = { workspace = true }
+ecdsa = { workspace = true }
+
+# COSE/CBOR for Nitro
+coset = { workspace = true }
+ciborium = { workspace = true }
+
+# Common
+sha2 = { workspace = true }
+hex = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[lib]
+name = "rawdogtpm2_verify"
+path = "src/lib.rs"
