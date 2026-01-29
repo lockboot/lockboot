@@ -1,37 +1,111 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! X.509 certificate handling
+//! X.509 certificate handling using rustls-webpki for chain validation
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
-use der::Decode;
-use ecdsa::signature::hazmat::PrehashVerifier;
+use der::{Decode, Encode};
+use pki_types::{CertificateDer, UnixTime};
+use webpki::{anchor_from_trusted_cert, EndEntityCert, KeyUsage};
 use sha2::{Digest, Sha256};
 use x509_cert::Certificate;
 
 use crate::error::VerifyError;
 
+/// Maximum allowed certificate chain depth (to prevent DoS)
+pub const MAX_CHAIN_DEPTH: usize = 10;
+
+/// PEM certificate begin marker
+const PEM_CERT_BEGIN: &str = "-----BEGIN CERTIFICATE-----";
+/// PEM certificate end marker
+const PEM_CERT_END: &str = "-----END CERTIFICATE-----";
+
 /// Parse X.509 certificate chain from PEM format
 ///
-/// Returns certificates in order from the PEM file (typically leaf first, root last)
+/// Returns certificates in order from the PEM file (typically leaf first, root last).
+///
+/// This parser is strict about:
+/// - Exact BEGIN/END markers (not just "contains")
+/// - No non-whitespace data between certificates
+/// - Valid base64 content within certificate blocks
 pub fn parse_cert_chain_pem(pem: &str) -> Result<Vec<Certificate>, VerifyError> {
     let mut certs = Vec::new();
     let mut current_cert = String::new();
     let mut in_cert = false;
+    let mut line_number = 0;
 
     for line in pem.lines() {
-        if line.contains("-----BEGIN CERTIFICATE-----") {
+        line_number += 1;
+        let trimmed = line.trim();
+
+        // Check for BEGIN marker
+        if trimmed == PEM_CERT_BEGIN {
+            if in_cert {
+                return Err(VerifyError::CertificateParse(format!(
+                    "Line {}: Unexpected BEGIN marker inside certificate block",
+                    line_number
+                )));
+            }
             in_cert = true;
             current_cert.clear();
-        } else if line.contains("-----END CERTIFICATE-----") {
+            continue;
+        }
+
+        // Check for END marker
+        if trimmed == PEM_CERT_END {
+            if !in_cert {
+                return Err(VerifyError::CertificateParse(format!(
+                    "Line {}: END marker without matching BEGIN",
+                    line_number
+                )));
+            }
             in_cert = false;
+
             // Decode the certificate
+            if current_cert.is_empty() {
+                return Err(VerifyError::CertificateParse(format!(
+                    "Line {}: Empty certificate content",
+                    line_number
+                )));
+            }
+
             let der_bytes = base64_decode(&current_cert)?;
             let cert = Certificate::from_der(&der_bytes)
-                .map_err(|e| VerifyError::CertificateParse(e.to_string()))?;
+                .map_err(|e| VerifyError::CertificateParse(format!(
+                    "Line {}: Invalid DER: {}",
+                    line_number, e
+                )))?;
             certs.push(cert);
-        } else if in_cert {
-            current_cert.push_str(line.trim());
+            continue;
         }
+
+        // Inside a certificate block: accumulate base64 content
+        if in_cert {
+            // Validate that line contains only base64 characters
+            if !trimmed.is_empty() && !is_valid_base64_line(trimmed) {
+                return Err(VerifyError::CertificateParse(format!(
+                    "Line {}: Invalid base64 character in certificate",
+                    line_number
+                )));
+            }
+            current_cert.push_str(trimmed);
+            continue;
+        }
+
+        // Outside certificate blocks: only whitespace is allowed
+        if !trimmed.is_empty() {
+            return Err(VerifyError::CertificateParse(format!(
+                "Line {}: Unexpected content outside certificate block: '{}'",
+                line_number,
+                if trimmed.len() > 20 { &trimmed[..20] } else { trimmed }
+            )));
+        }
+    }
+
+    // Check for unclosed certificate block
+    if in_cert {
+        return Err(VerifyError::CertificateParse(
+            "Unclosed certificate block (missing END marker)".into(),
+        ));
     }
 
     if certs.is_empty() {
@@ -41,6 +115,11 @@ pub fn parse_cert_chain_pem(pem: &str) -> Result<Vec<Certificate>, VerifyError> 
     }
 
     Ok(certs)
+}
+
+/// Check if a string contains only valid base64 characters
+fn is_valid_base64_line(s: &str) -> bool {
+    s.chars().all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '/' || c == '=')
 }
 
 /// Decode base64 string
@@ -67,87 +146,95 @@ pub fn hash_public_key(pubkey_bytes: &[u8]) -> String {
     hex::encode(digest)
 }
 
-/// Validate a certificate chain
+/// Result of certificate chain validation
+#[derive(Debug)]
+pub struct ChainValidationResult {
+    /// SHA-256 hash of the root CA's public key (hex string)
+    pub root_pubkey_hash: String,
+}
+
+/// Validate a certificate chain using webpki
 ///
-/// Verifies that each certificate's signature can be verified by the next certificate
-/// in the chain (the issuer). The last certificate is assumed to be self-signed or a root.
-pub fn validate_cert_chain(chain: &[Certificate]) -> Result<(), VerifyError> {
+/// Chain should be leaf-first, root-last. Time must be provided by caller.
+pub fn validate_cert_chain(
+    chain: &[Certificate],
+    time: UnixTime,
+) -> Result<ChainValidationResult, VerifyError> {
     if chain.is_empty() {
         return Err(VerifyError::ChainValidation("Empty certificate chain".into()));
     }
-
-    // For each certificate except the last, verify it was signed by the next
-    for i in 0..chain.len().saturating_sub(1) {
-        let cert = &chain[i];
-        let issuer = &chain[i + 1];
-        verify_certificate_signature(cert, issuer)?;
+    if chain.len() > MAX_CHAIN_DEPTH {
+        return Err(VerifyError::ChainValidation(format!(
+            "Certificate chain too deep: {} certificates (max {})",
+            chain.len(),
+            MAX_CHAIN_DEPTH
+        )));
     }
 
-    Ok(())
+    // Get signature verification algorithms from rustls-rustcrypto
+    let sig_algs = rustls_rustcrypto::provider()
+        .signature_verification_algorithms
+        .all;
+
+    // Convert to DER format for webpki
+    let cert_ders: Vec<CertificateDer> = chain
+        .iter()
+        .map(|c| {
+            let der = c.to_der().map_err(|e| {
+                VerifyError::CertificateParse(format!("Failed to encode cert to DER: {}", e))
+            })?;
+            Ok(CertificateDer::from(der))
+        })
+        .collect::<Result<Vec<_>, VerifyError>>()?;
+
+    // Root is last in chain - create trust anchor from it
+    let root_der = &cert_ders[cert_ders.len() - 1];
+    let trust_anchor = anchor_from_trusted_cert(root_der)
+        .map_err(|e| VerifyError::ChainValidation(format!("Invalid root certificate: {:?}", e)))?;
+
+    // Leaf is first
+    let ee_cert = EndEntityCert::try_from(&cert_ders[0])
+        .map_err(|e| VerifyError::CertificateParse(format!("Invalid leaf certificate: {:?}", e)))?;
+
+    // Intermediates are everything between leaf and root
+    let intermediates: Vec<CertificateDer> = if cert_ders.len() > 2 {
+        cert_ders[1..cert_ders.len() - 1].to_vec()
+    } else {
+        Vec::new()
+    };
+
+    // Use webpki to verify the chain
+    ee_cert
+        .verify_for_usage(
+            sig_algs,
+            &[trust_anchor],
+            &intermediates,
+            time,
+            KeyUsage::client_auth(),
+            None, // no revocation checking
+            None, // no custom path verification
+        )
+        .map_err(|e| VerifyError::ChainValidation(format!("Chain validation failed: {:?}", e)))?;
+
+    // Extract and hash root's public key
+    let root_pubkey = extract_public_key(&chain[chain.len() - 1])?;
+    let root_hash = hash_public_key(&root_pubkey);
+
+    Ok(ChainValidationResult {
+        root_pubkey_hash: root_hash,
+    })
 }
 
-/// Verify that a certificate was signed by the issuer
-pub(crate) fn verify_certificate_signature(
-    cert: &Certificate,
-    issuer: &Certificate,
-) -> Result<(), VerifyError> {
-    use p256::ecdsa::{Signature as P256Signature, VerifyingKey as P256VerifyingKey};
-    use p384::ecdsa::{Signature as P384Signature, VerifyingKey as P384VerifyingKey};
-
-    // Get the issuer's public key
-    let issuer_pubkey = extract_public_key(issuer)?;
-
-    // Get the signature from the certificate
-    let sig_bytes = cert
-        .signature
-        .as_bytes()
-        .ok_or_else(|| VerifyError::ChainValidation("Invalid signature bits".into()))?;
-
-    // Get the TBS (to-be-signed) certificate data
-    let tbs_der = der::Encode::to_der(&cert.tbs_certificate)
-        .map_err(|e| VerifyError::ChainValidation(format!("Failed to encode TBS: {}", e)))?;
-
-    // Determine the signature algorithm
-    let sig_alg = &cert.signature_algorithm;
-    let alg_oid = sig_alg.oid.to_string();
-
-    // ecdsa-with-SHA256: 1.2.840.10045.4.3.2
-    // ecdsa-with-SHA384: 1.2.840.10045.4.3.3
-    // ecdsa-with-SHA512: 1.2.840.10045.4.3.4
-    match alg_oid.as_str() {
-        "1.2.840.10045.4.3.2" => {
-            // ECDSA with SHA-256 (P-256)
-            let verifying_key = P256VerifyingKey::from_sec1_bytes(&issuer_pubkey)
-                .map_err(|e| VerifyError::ChainValidation(format!("Invalid P-256 key: {}", e)))?;
-            let signature = P256Signature::from_der(sig_bytes)
-                .map_err(|e| VerifyError::ChainValidation(format!("Invalid signature: {}", e)))?;
-            let digest = Sha256::digest(&tbs_der);
-            verifying_key
-                .verify_prehash(&digest, &signature)
-                .map_err(|e| VerifyError::ChainValidation(format!("Signature invalid: {}", e)))?;
-        }
-        "1.2.840.10045.4.3.3" => {
-            // ECDSA with SHA-384 (P-384)
-            let verifying_key = P384VerifyingKey::from_sec1_bytes(&issuer_pubkey)
-                .map_err(|e| VerifyError::ChainValidation(format!("Invalid P-384 key: {}", e)))?;
-            let signature = P384Signature::from_der(sig_bytes)
-                .map_err(|e| VerifyError::ChainValidation(format!("Invalid signature: {}", e)))?;
-            // SHA-384 digest
-            use sha2::Sha384;
-            let digest = Sha384::digest(&tbs_der);
-            verifying_key
-                .verify_prehash(&digest, &signature)
-                .map_err(|e| VerifyError::ChainValidation(format!("Signature invalid: {}", e)))?;
-        }
-        _ => {
-            return Err(VerifyError::UnsupportedAlgorithm(format!(
-                "Unsupported signature algorithm OID: {}",
-                alg_oid
-            )));
-        }
-    }
-
-    Ok(())
+/// Parse PEM and validate certificate chain
+///
+/// Convenience wrapper that parses PEM then validates.
+/// Chain should be leaf-first, root-last in the PEM.
+pub fn parse_and_validate_cert_chain(
+    chain_pem: &str,
+    time: UnixTime,
+) -> Result<ChainValidationResult, VerifyError> {
+    let certs = parse_cert_chain_pem(chain_pem)?;
+    validate_cert_chain(&certs, time)
 }
 
 #[cfg(test)]
@@ -167,5 +254,134 @@ mod tests {
         let input = "SGVsbG8gV29ybGQ="; // "Hello World"
         let decoded = STANDARD.decode(input).unwrap();
         assert_eq!(decoded, b"Hello World");
+    }
+
+    // === PEM Parsing Edge Cases ===
+
+    #[test]
+    fn test_reject_no_certificates() {
+        let pem = "This is not a PEM file at all";
+        let result = parse_cert_chain_pem(pem);
+        assert!(matches!(result, Err(VerifyError::CertificateParse(_))));
+    }
+
+    #[test]
+    fn test_reject_empty_pem() {
+        let pem = "";
+        let result = parse_cert_chain_pem(pem);
+        assert!(matches!(result, Err(VerifyError::CertificateParse(_))));
+    }
+
+    #[test]
+    fn test_reject_missing_end_marker() {
+        let pem = "-----BEGIN CERTIFICATE-----\nMIIB";
+        let result = parse_cert_chain_pem(pem);
+        // Should fail because no END marker means no certificate is completed
+        assert!(matches!(result, Err(VerifyError::CertificateParse(_))));
+    }
+
+    #[test]
+    fn test_reject_empty_certificate_content() {
+        let pem = "-----BEGIN CERTIFICATE-----\n-----END CERTIFICATE-----";
+        let result = parse_cert_chain_pem(pem);
+        // Empty base64 content should fail DER parsing
+        assert!(matches!(result, Err(VerifyError::CertificateParse(_))));
+    }
+
+    #[test]
+    fn test_reject_invalid_base64() {
+        let pem = "-----BEGIN CERTIFICATE-----\n\
+                   !!!invalid base64!!!\n\
+                   -----END CERTIFICATE-----";
+        let result = parse_cert_chain_pem(pem);
+        assert!(matches!(result, Err(VerifyError::CertificateParse(_))));
+    }
+
+    #[test]
+    fn test_reject_truncated_base64() {
+        // Valid base64 prefix but incomplete (missing padding)
+        let pem = "-----BEGIN CERTIFICATE-----\n\
+                   MIIB\n\
+                   -----END CERTIFICATE-----";
+        let result = parse_cert_chain_pem(pem);
+        // Should fail either in base64 decode or DER parse
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_reject_invalid_der() {
+        // Valid base64, but not valid DER certificate
+        let pem = "-----BEGIN CERTIFICATE-----\n\
+                   SGVsbG8gV29ybGQ=\n\
+                   -----END CERTIFICATE-----";
+        let result = parse_cert_chain_pem(pem);
+        assert!(matches!(result, Err(VerifyError::CertificateParse(_))));
+    }
+
+    // === Strict PEM Parsing Tests ===
+
+    #[test]
+    fn test_reject_garbage_between_markers() {
+        // Non-whitespace data outside certificate blocks should be rejected
+        // This tests that the parser rejects garbage BEFORE any cert
+        let pem = "garbage data here\n\
+                   -----BEGIN CERTIFICATE-----\n\
+                   SGVsbG8=\n\
+                   -----END CERTIFICATE-----";
+        let result = parse_cert_chain_pem(pem);
+        assert!(matches!(result, Err(VerifyError::CertificateParse(ref msg)) if msg.contains("Unexpected content")));
+    }
+
+    #[test]
+    fn test_allow_whitespace_between_certs() {
+        // Whitespace between certificates should be allowed (though certs themselves are invalid DER)
+        let pem = "-----BEGIN CERTIFICATE-----\n\
+                   SGVsbG8=\n\
+                   -----END CERTIFICATE-----\n\
+                   \n\
+                   \n\
+                   -----BEGIN CERTIFICATE-----\n\
+                   V29ybGQ=\n\
+                   -----END CERTIFICATE-----";
+        let result = parse_cert_chain_pem(pem);
+        // Will fail on invalid DER, not on parsing
+        assert!(matches!(result, Err(VerifyError::CertificateParse(ref msg)) if msg.contains("DER")));
+    }
+
+    #[test]
+    fn test_reject_nested_begin_marker() {
+        // Nested BEGIN marker should be rejected
+        let pem = "-----BEGIN CERTIFICATE-----\n\
+                   SGVsbG8=\n\
+                   -----BEGIN CERTIFICATE-----\n\
+                   V29ybGQ=\n\
+                   -----END CERTIFICATE-----";
+        let result = parse_cert_chain_pem(pem);
+        assert!(matches!(result, Err(VerifyError::CertificateParse(ref msg)) if msg.contains("Unexpected BEGIN")));
+    }
+
+    #[test]
+    fn test_reject_end_without_begin() {
+        // END marker without BEGIN should be rejected
+        let pem = "-----END CERTIFICATE-----";
+        let result = parse_cert_chain_pem(pem);
+        assert!(matches!(result, Err(VerifyError::CertificateParse(ref msg)) if msg.contains("without matching BEGIN")));
+    }
+
+    #[test]
+    fn test_reject_unclosed_block() {
+        // Unclosed certificate block should be rejected
+        let pem = "-----BEGIN CERTIFICATE-----\n\
+                   SGVsbG8=\n";
+        let result = parse_cert_chain_pem(pem);
+        assert!(matches!(result, Err(VerifyError::CertificateParse(ref msg)) if msg.contains("missing END")));
+    }
+
+    #[test]
+    fn test_is_valid_base64_line() {
+        assert!(is_valid_base64_line("ABCDabcd0123+/=="));
+        assert!(!is_valid_base64_line("ABC!@#"));
+        assert!(!is_valid_base64_line("ABC DEF"));  // space not allowed
+        assert!(is_valid_base64_line(""));  // empty is valid
     }
 }

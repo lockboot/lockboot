@@ -13,7 +13,12 @@ der = { workspace = true }
 spki = { workspace = true }
 x509-cert = { workspace = true }
 
-# Signature verification
+# Certificate chain validation (rustls ecosystem)
+webpki = { workspace = true }
+pki-types = { workspace = true }
+rustls-rustcrypto = { workspace = true }
+
+# Signature verification (still needed for TPM AK signature)
 p256 = { workspace = true }
 p384 = { workspace = true }
 ecdsa = { workspace = true }

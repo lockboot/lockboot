@@ -28,6 +28,9 @@ pub enum VerifyError {
     #[error("COSE signature verification failed: {0}")]
     CoseVerify(String),
 
-    #[error("Unsupported algorithm: {0}")]
-    UnsupportedAlgorithm(String),
+    #[error("PCR index out of bounds: {0}")]
+    PcrIndexOutOfBounds(String),
+
+    #[error("No attestations could be verified: {0}")]
+    NoValidAttestation(String),
 }

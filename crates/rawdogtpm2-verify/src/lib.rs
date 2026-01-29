@@ -21,15 +21,22 @@ use serde::Serialize;
 pub use error::VerifyError;
 
 // Re-export TPM types and functions
-pub use tpm::{verify_ecdsa_p256, verify_tpm_attestation, TpmVerifyResult};
+pub use tpm::{
+    calculate_pcr_policy, verify_ecdsa_p256, verify_pcr_policy, verify_tpm_attestation,
+    TpmVerifyResult,
+};
 
 // Re-export Nitro types and functions
 pub use nitro::{verify_nitro_attestation, NitroDocument, NitroVerifyResult};
 
 // Re-export X.509 utility functions
 pub use x509::{
-    extract_public_key, hash_public_key, parse_cert_chain_pem, validate_cert_chain,
+    extract_public_key, hash_public_key, parse_and_validate_cert_chain, parse_cert_chain_pem,
+    validate_cert_chain, ChainValidationResult, MAX_CHAIN_DEPTH,
 };
+
+// Re-export time type for testing
+pub use pki_types::UnixTime;
 
 // Re-export types from rawdogtpm2 for convenience
 pub use rawdogtpm2::a9n::{
@@ -54,10 +61,16 @@ pub struct VerificationSummary {
 /// 1. EK public key from attestation matches the certificate's EK public key
 /// 2. AK signature over the nonce is valid
 /// 3. Certificate chain validates to root CA
+///
+/// # Errors
+/// Returns `NoValidAttestation` if:
+/// - There are TPM attestations but none could be verified (missing certs/keys)
+/// - An attestation references an unknown key type
 pub fn verify_attestation_output(
     output: &AttestationOutput,
 ) -> Result<VerificationSummary, VerifyError> {
     let mut tpm_results = BTreeMap::new();
+    let mut skipped: Vec<String> = Vec::new();
 
     // Verify each TPM attestation
     for (key_type, attestation) in &output.attestation.tpm {
@@ -66,7 +79,12 @@ pub fn verify_attestation_output(
             "rsa_2048" => output.ek_certificates.rsa_2048.as_ref(),
             "ecc_p256" => output.ek_certificates.ecc_p256.as_ref(),
             "ecc_p384" => output.ek_certificates.ecc_p384.as_ref(),
-            _ => None,
+            _ => {
+                return Err(VerifyError::NoValidAttestation(format!(
+                    "unknown key type '{}' in attestation",
+                    key_type
+                )));
+            }
         };
 
         // Get the corresponding EK public key from attestation output
@@ -75,18 +93,45 @@ pub fn verify_attestation_output(
         // Get the corresponding signing key (AK) public key
         let ak_pubkey = output.signing_key_public_keys.get(key_type);
 
-        if let (Some(cert_pem), Some(ek_pk), Some(ak_pk)) = (ek_cert, ek_pubkey, ak_pubkey) {
-            let result = verify_tpm_attestation(
-                &attestation.attest_data,
-                &attestation.signature,
-                &ak_pk.x,
-                &ak_pk.y,
-                &ek_pk.x,
-                &ek_pk.y,
-                cert_pem,
-            )?;
-            tpm_results.insert(key_type.clone(), result);
+        // All three must be present - track what's missing
+        let missing: Vec<&str> = [
+            ek_cert.is_none().then_some("EK certificate"),
+            ek_pubkey.is_none().then_some("EK public key"),
+            ak_pubkey.is_none().then_some("AK public key"),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+
+        if !missing.is_empty() {
+            skipped.push(format!("{}: missing {}", key_type, missing.join(", ")));
+            continue;
         }
+
+        let (cert_pem, ek_pk, ak_pk) = (
+            ek_cert.unwrap(),
+            ek_pubkey.unwrap(),
+            ak_pubkey.unwrap(),
+        );
+
+        let result = verify_tpm_attestation(
+            &attestation.attest_data,
+            &attestation.signature,
+            &ak_pk.x,
+            &ak_pk.y,
+            &ek_pk.x,
+            &ek_pk.y,
+            cert_pem,
+        )?;
+        tpm_results.insert(key_type.clone(), result);
+    }
+
+    // Fail if there were TPM attestations but none could be verified
+    if !output.attestation.tpm.is_empty() && tpm_results.is_empty() {
+        return Err(VerifyError::NoValidAttestation(format!(
+            "all TPM attestations skipped: {}",
+            skipped.join("; ")
+        )));
     }
 
     // Verify Nitro attestation if present
