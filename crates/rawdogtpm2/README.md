@@ -248,3 +248,41 @@ Supports multiple PCR banks:
 - SHA-256 (32 bytes)
 - SHA-384 (48 bytes)
 - SHA-512 (64 bytes)
+
+## Architecture
+
+### Attestation Model
+
+The library implements a TPM-based attestation model where:
+
+1. **Endorsement Key (EK)** - A TPM's identity, certified by the manufacturer. Created using the TCG standard template for deterministic key derivation. The EK is decrypt-only (cannot sign).
+
+2. **Attestation Key (AK)** - A signing key created with a PCR policy. The AK can only be used when PCRs match specific values, cryptographically binding the key to the system state.
+
+3. **PCR Policy** - A SHA-256 digest computed from PCR values. When an AK is created with an `authPolicy`, it can only sign when `TPM2_PolicyPCR` succeeds with matching values.
+
+4. **TPM2_Certify** - The AK self-certifies, producing a `TPM2B_ATTEST` structure containing the AK's name (which includes its `authPolicy`). This proves the AK exists and is bound to specific PCR values.
+
+### Chain of Trust
+
+```mermaid
+flowchart TD
+    A["<b>Trust Anchor</b><br/>Nitro Root CA / TPM Manufacturer / Cloud Provider"]
+    B["<b>Platform Attestation</b><br/>Nitro Document / EK Certificate / AK Certificate"]
+    C["<b>Signing Key (AK)</b><br/>Bound to PCR values via authPolicy"]
+    D["<b>TPM2B_ATTEST + Signature</b><br/>Contains: nonce, AK name (proves PCR binding)"]
+
+    A -->|signs| B
+    B -->|binds| C
+    C -->|signs| D
+```
+
+### Platform-Specific Trust
+
+| Platform | Trust Anchor | AK Binding Method |
+|----------|-------------|-------------------|
+| AWS Nitro | Nitro Root CA | Nitro document `public_key` field |
+| GCP Shielded VM | Google CA | AK certificate (NV 0x01c10000) |
+| Azure Trusted Launch | Microsoft CA | AK certificate (NV 0x01C101D0) |
+
+See [AWS-NITRO.md](./AWS-NITRO.md) for detailed AWS Nitro attestation documentation.
