@@ -5,6 +5,7 @@
 use std::collections::BTreeMap;
 
 use ecdsa::signature::hazmat::PrehashVerifier;
+use p256::ecdsa::{Signature as P256Signature, VerifyingKey as P256VerifyingKey};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
@@ -13,11 +14,8 @@ use pki_types::UnixTime;
 use crate::error::VerifyError;
 use crate::x509::{extract_public_key, parse_and_validate_cert_chain, parse_cert_chain_pem};
 
-/// TPM2_CC_PolicyPCR command code
-const TPM_CC_POLICY_PCR: u32 = 0x0000017F;
-
-/// TPM_ALG_SHA256
-const TPM_ALG_SHA256: u16 = 0x000B;
+// Import from rawdogtpm2 (single source of truth)
+use rawdogtpm2::{PcrOps, Tpm};
 
 /// Result of successful TPM attestation verification
 ///
@@ -40,14 +38,12 @@ pub fn verify_ecdsa_p256(
     signature_der: &[u8],
     public_key: &[u8],
 ) -> Result<(), VerifyError> {
-    use p256::ecdsa::{Signature, VerifyingKey};
-
     // Parse the public key (SEC1/SECG format: 0x04 || X || Y for uncompressed)
-    let verifying_key = VerifyingKey::from_sec1_bytes(public_key)
+    let verifying_key = P256VerifyingKey::from_sec1_bytes(public_key)
         .map_err(|e| VerifyError::SignatureInvalid(format!("Invalid public key: {}", e)))?;
 
     // Parse the DER-encoded signature
-    let signature = Signature::from_der(signature_der)
+    let signature = P256Signature::from_der(signature_der)
         .map_err(|e| VerifyError::SignatureInvalid(format!("Invalid signature DER: {}", e)))?;
 
     // TPM signs the SHA-256 hash of the message
@@ -133,14 +129,48 @@ pub fn verify_tpm_attestation(
     })
 }
 
+/// Verify TPM signature only (without EK certificate chain validation)
+///
+/// This is used in the Nitro path where trust comes from the Nitro attestation
+/// binding the TPM signing key. No EK certificate validation is needed.
+///
+/// # Arguments
+/// * `nonce_hex` - The nonce/attest_data as hex string
+/// * `signature_hex` - DER-encoded ECDSA signature as hex string (from AK)
+/// * `ak_pubkey_x_hex` - AK public key X coordinate (hex)
+/// * `ak_pubkey_y_hex` - AK public key Y coordinate (hex)
+///
+/// # Returns
+/// The verified nonce (hex-encoded) if signature is valid.
+pub fn verify_tpm_signature_only(
+    nonce_hex: &str,
+    signature_hex: &str,
+    ak_pubkey_x_hex: &str,
+    ak_pubkey_y_hex: &str,
+) -> Result<String, VerifyError> {
+    // Decode hex inputs
+    let nonce = hex::decode(nonce_hex)?;
+    let signature = hex::decode(signature_hex)?;
+    let ak_x = hex::decode(ak_pubkey_x_hex)?;
+    let ak_y = hex::decode(ak_pubkey_y_hex)?;
+
+    // Construct AK public key in SEC1 uncompressed format: 0x04 || X || Y
+    let mut ak_pubkey = vec![0x04];
+    ak_pubkey.extend(&ak_x);
+    ak_pubkey.extend(&ak_y);
+
+    // Verify the AK's signature over the nonce
+    verify_ecdsa_p256(&nonce, &signature, &ak_pubkey)?;
+
+    Ok(nonce_hex.to_string())
+}
+
 /// Calculate the expected PCR policy digest from PCR values
 ///
 /// This calculates the TPM2 PolicyPCR digest that would be used as an
 /// authPolicy for a key bound to the given PCR values.
 ///
-/// The calculation follows TPM2 spec:
-/// 1. pcrDigest = SHA256(PCR0 || PCR1 || ... || PCRn) for selected PCRs
-/// 2. policyDigest = SHA256(zeros || TPM_CC_PolicyPCR || TPML_PCR_SELECTION || pcrDigest)
+/// Uses the same implementation as rawdogtpm2 to ensure consistency.
 ///
 /// # Arguments
 /// * `pcrs` - Map of PCR index to hex-encoded PCR value (only SHA-256 bank)
@@ -160,64 +190,31 @@ pub fn calculate_pcr_policy(pcrs: &BTreeMap<u8, String>) -> Result<String, Verif
         return Err(VerifyError::InvalidAttest("No PCR values provided".into()));
     }
 
-    // Validate all PCR indices are in valid range (0-23)
-    for &idx in pcrs.keys() {
+    // Validate and convert PCR values from hex strings to bytes
+    // PCRs must be in sorted order (BTreeMap guarantees this)
+    let mut pcr_values: Vec<(u8, Vec<u8>)> = Vec::with_capacity(pcrs.len());
+    for (&idx, value_hex) in pcrs.iter() {
         if idx > 23 {
             return Err(VerifyError::InvalidAttest(format!(
                 "PCR index {} out of range (max 23)",
                 idx
             )));
         }
-    }
-
-    // Step 1: Calculate PCR digest (hash of selected PCR values in order)
-    let mut pcr_hasher = Sha256::new();
-    for idx in 0..=23u8 {
-        if let Some(value_hex) = pcrs.get(&idx) {
-            let value_bytes = hex::decode(value_hex)?;
-            if value_bytes.len() != 32 {
-                return Err(VerifyError::InvalidAttest(format!(
-                    "PCR {} has invalid length: expected 32 bytes, got {}",
-                    idx,
-                    value_bytes.len()
-                )));
-            }
-            pcr_hasher.update(&value_bytes);
+        let value_bytes = hex::decode(value_hex)?;
+        if value_bytes.len() != 32 {
+            return Err(VerifyError::InvalidAttest(format!(
+                "PCR {} has invalid length: expected 32 bytes, got {}",
+                idx,
+                value_bytes.len()
+            )));
         }
-    }
-    let pcr_digest = pcr_hasher.finalize();
-
-    // Step 2: Build PCR selection bitmask (3 bytes for PCRs 0-23)
-    let mut pcr_select = [0u8; 3];
-    for &idx in pcrs.keys() {
-        pcr_select[idx as usize / 8] |= 1 << (idx % 8);
+        pcr_values.push((idx, value_bytes));
     }
 
-    // Step 3: Calculate policy digest
-    // policyDigest = SHA256(previousDigest || TPM_CC_PolicyPCR || TPML_PCR_SELECTION || pcrDigest)
-    let mut policy_hasher = Sha256::new();
+    // Use rawdogtpm2's implementation (single source of truth)
+    let policy_digest = Tpm::calculate_pcr_policy_digest(&pcr_values)
+        .map_err(|e| VerifyError::InvalidAttest(format!("PCR policy calculation failed: {}", e)))?;
 
-    // previousDigest: starts as all zeros (32 bytes for SHA-256)
-    policy_hasher.update(&[0u8; 32]);
-
-    // TPM_CC_PolicyPCR (big-endian)
-    policy_hasher.update(&TPM_CC_POLICY_PCR.to_be_bytes());
-
-    // TPML_PCR_SELECTION structure:
-    // - count: u32 (1 bank)
-    policy_hasher.update(&1u32.to_be_bytes());
-    // TPMS_PCR_SELECTION:
-    // - hash: u16 (TPM_ALG_SHA256)
-    policy_hasher.update(&TPM_ALG_SHA256.to_be_bytes());
-    // - sizeOfSelect: u8 (3 bytes)
-    policy_hasher.update(&[3u8]);
-    // - pcrSelect: [u8; 3]
-    policy_hasher.update(&pcr_select);
-
-    // PCR digest
-    policy_hasher.update(&pcr_digest);
-
-    let policy_digest = policy_hasher.finalize();
     Ok(hex::encode(policy_digest))
 }
 
@@ -247,6 +244,125 @@ pub fn verify_pcr_policy(
 
     Ok(())
 }
+
+// =============================================================================
+// TPM2B_ATTEST parsing and NIZK verification
+// =============================================================================
+
+/// TPM_GENERATED magic value (0xff544347 = "ÿTCG")
+const TPM_GENERATED_VALUE: u32 = 0xff544347;
+
+/// TPM_ST_ATTEST_CERTIFY structure type
+const TPM_ST_ATTEST_CERTIFY: u16 = 0x8017;
+
+/// Size of TPMS_CLOCK_INFO structure: clock(8) + resetCount(4) + restartCount(4) + safe(1)
+const TPMS_CLOCK_INFO_SIZE: usize = 17;
+
+/// Parsed TPMS_ATTEST structure (from TPM2_Certify)
+#[derive(Debug)]
+pub struct TpmAttestInfo {
+    /// Nonce/qualifying data from extraData field (raw bytes)
+    pub nonce: Vec<u8>,
+    /// Name of the certified object (nameAlg || H(public_area))
+    pub certified_name: Vec<u8>,
+    /// Name of the signing key
+    pub signer_name: Vec<u8>,
+}
+
+/// Parse TPM2B_ATTEST structure (CERTIFY type)
+///
+/// TPM2B_ATTEST contains a TPMS_ATTEST structure which includes:
+/// - magic: 0xff544347 (TPM_GENERATED_VALUE)
+/// - type: 0x8017 (TPM_ST_ATTEST_CERTIFY)
+/// - qualifiedSigner: TPM2B_NAME
+/// - extraData: TPM2B_DATA (our nonce)
+/// - clockInfo: TPMS_CLOCK_INFO
+/// - firmwareVersion: u64
+/// - attested.certify.name: TPM2B_NAME (certified object's name)
+/// - attested.certify.qualifiedName: TPM2B_NAME
+pub fn parse_tpm2b_attest(data: &[u8]) -> Result<TpmAttestInfo, VerifyError> {
+    if data.len() < 6 {
+        return Err(VerifyError::InvalidAttest("TPM2B_ATTEST too short".into()));
+    }
+
+    let mut offset = 0;
+
+    // magic (4 bytes)
+    let magic = u32::from_be_bytes(data[offset..offset + 4].try_into().unwrap());
+    if magic != TPM_GENERATED_VALUE {
+        return Err(VerifyError::InvalidAttest(format!(
+            "Invalid TPM magic: expected 0x{:08x}, got 0x{:08x}",
+            TPM_GENERATED_VALUE, magic
+        )));
+    }
+    offset += 4;
+
+    // type (2 bytes)
+    let attest_type = u16::from_be_bytes(data[offset..offset + 2].try_into().unwrap());
+    if attest_type != TPM_ST_ATTEST_CERTIFY {
+        return Err(VerifyError::InvalidAttest(format!(
+            "Invalid attest type: expected 0x{:04x} (CERTIFY), got 0x{:04x}",
+            TPM_ST_ATTEST_CERTIFY, attest_type
+        )));
+    }
+    offset += 2;
+
+    // qualifiedSigner (TPM2B_NAME)
+    if offset + 2 > data.len() {
+        return Err(VerifyError::InvalidAttest("Truncated qualifiedSigner".into()));
+    }
+    let signer_size = u16::from_be_bytes(data[offset..offset + 2].try_into().unwrap()) as usize;
+    offset += 2;
+    if offset + signer_size > data.len() {
+        return Err(VerifyError::InvalidAttest("Truncated qualifiedSigner data".into()));
+    }
+    let signer_name = data[offset..offset + signer_size].to_vec();
+    offset += signer_size;
+
+    // extraData (TPM2B_DATA) - this is our nonce
+    if offset + 2 > data.len() {
+        return Err(VerifyError::InvalidAttest("Truncated extraData".into()));
+    }
+    let extra_size = u16::from_be_bytes(data[offset..offset + 2].try_into().unwrap()) as usize;
+    offset += 2;
+    if offset + extra_size > data.len() {
+        return Err(VerifyError::InvalidAttest("Truncated extraData data".into()));
+    }
+    let nonce = data[offset..offset + extra_size].to_vec();
+    offset += extra_size;
+
+    // clockInfo (TPMS_CLOCK_INFO)
+    // clock: u64, resetCount: u32, restartCount: u32, safe: u8
+    if offset + TPMS_CLOCK_INFO_SIZE > data.len() {
+        return Err(VerifyError::InvalidAttest("Truncated clockInfo".into()));
+    }
+    offset += TPMS_CLOCK_INFO_SIZE;
+
+    // firmwareVersion (8 bytes)
+    if offset + 8 > data.len() {
+        return Err(VerifyError::InvalidAttest("Truncated firmwareVersion".into()));
+    }
+    offset += 8;
+
+    // attested (TPMS_CERTIFY_INFO)
+    // - name (TPM2B_NAME)
+    if offset + 2 > data.len() {
+        return Err(VerifyError::InvalidAttest("Truncated certified name".into()));
+    }
+    let name_size = u16::from_be_bytes(data[offset..offset + 2].try_into().unwrap()) as usize;
+    offset += 2;
+    if offset + name_size > data.len() {
+        return Err(VerifyError::InvalidAttest("Truncated certified name data".into()));
+    }
+    let certified_name = data[offset..offset + name_size].to_vec();
+
+    Ok(TpmAttestInfo {
+        nonce,
+        certified_name,
+        signer_name,
+    })
+}
+
 
 #[cfg(test)]
 mod tests {

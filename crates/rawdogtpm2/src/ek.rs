@@ -10,7 +10,6 @@
 
 use anyhow::{bail, Result};
 
-use crate::pcr::PcrOps;
 use crate::{
     CertifyResult, CommandBuffer, EccPublicKey, ObjectAttributes, PrimaryKeyResult,
     ResponseBuffer, TpmAlg, TpmCc, TpmEccCurve, TpmSt, Tpm,
@@ -31,12 +30,11 @@ pub trait EkOps {
     /// Create a primary ECC P-256 signing key in the specified hierarchy (no policy)
     fn create_primary_ecc_key(&mut self, hierarchy: u32) -> Result<PrimaryKeyResult>;
 
-    /// Create a primary ECC P-256 signing key with PCR policy
-    fn create_primary_ecc_key_with_pcr_policy(
+    /// Create a primary ECC P-256 signing key with a specific authPolicy
+    fn create_primary_ecc_key_with_policy(
         &mut self,
         hierarchy: u32,
-        pcr_indices: &[u8],
-        bank_alg: TpmAlg,
+        auth_policy: &[u8],
     ) -> Result<PrimaryKeyResult>;
 
     /// Create the TCG standard ECC P-256 Endorsement Key
@@ -117,22 +115,6 @@ impl EkOps for Tpm {
         }
 
         Ok(PrimaryKeyResult { handle, public_key })
-    }
-
-    fn create_primary_ecc_key_with_pcr_policy(
-        &mut self,
-        hierarchy: u32,
-        pcr_indices: &[u8],
-        bank_alg: TpmAlg,
-    ) -> Result<PrimaryKeyResult> {
-        // Read current PCR values from the specified bank
-        let pcr_values = self.pcr_read_bank(pcr_indices, bank_alg)?;
-
-        // Calculate policy digest
-        let policy_digest = Tpm::calculate_pcr_policy_digest(&pcr_values)?;
-
-        // Create key with this policy
-        self.create_primary_ecc_key_with_policy(hierarchy, &policy_digest)
     }
 
     fn create_standard_ek(&mut self) -> Result<PrimaryKeyResult> {
@@ -308,10 +290,7 @@ impl EkOps for Tpm {
             signature,
         })
     }
-}
 
-impl Tpm {
-    /// Create a primary ECC P-256 signing key with a specific authPolicy
     fn create_primary_ecc_key_with_policy(
         &mut self,
         hierarchy: u32,
@@ -424,13 +403,13 @@ fn build_ecc_public_area_with_policy(auth_policy: &[u8]) -> Vec<u8> {
 
 /// Build a TPM2B_PUBLIC structure for the TCG standard ECC P-256 EK
 ///
-/// Per TCG EK Credential Profile 2.6, the standard EK template has:
+/// Per TCG EK Credential Profile 2.6, the standard EK template (Template L-2) has:
 /// - Object attributes: 0x000300b2 (fixedTPM, fixedParent, sensitiveDataOrigin,
 ///   adminWithPolicy, restricted, decrypt)
 /// - authPolicy: PolicySecret(TPM_RH_ENDORSEMENT)
 /// - Symmetric: AES-128-CFB
 /// - Curve: NIST P-256
-/// - Unique: empty (x=0, y=0)
+/// - Unique: x = 32 zero bytes, y = 32 zero bytes
 fn build_standard_ek_public_area() -> Vec<u8> {
     let attrs = ObjectAttributes::new()
         .fixed_tpm()
@@ -439,6 +418,9 @@ fn build_standard_ek_public_area() -> Vec<u8> {
         .admin_with_policy()
         .restricted()
         .decrypt();
+
+    // Per TCG EK Credential Profile, unique field must be 32 zero bytes for x and y
+    let zero_32 = [0u8; 32];
 
     CommandBuffer::new()
         // TPMT_PUBLIC
@@ -454,9 +436,9 @@ fn build_standard_ek_public_area() -> Vec<u8> {
         .write_u16(TpmAlg::Null as u16) // scheme (decrypt-only, no signing)
         .write_u16(TpmEccCurve::NistP256 as u16) // curveID
         .write_u16(TpmAlg::Null as u16) // kdf
-        // unique (TPMS_ECC_POINT) - empty (TPM generates deterministically)
-        .write_u16(0) // x size
-        .write_u16(0) // y size
+        // unique (TPMS_ECC_POINT) - 32 zero bytes each per TCG template
+        .write_tpm2b(&zero_32) // x
+        .write_tpm2b(&zero_32) // y
         .into_vec()
 }
 

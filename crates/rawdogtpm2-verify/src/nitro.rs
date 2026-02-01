@@ -5,9 +5,10 @@
 use std::collections::BTreeMap;
 
 use ciborium::Value as CborValue;
-use coset::{CborSerializable, CoseSign1, TaggedCborSerializable};
+use coset::{CborSerializable, CoseSign1};
 use der::Decode;
 use ecdsa::signature::hazmat::PrehashVerifier;
+use p384::ecdsa::{Signature as P384Signature, VerifyingKey as P384VerifyingKey};
 use serde::Serialize;
 use sha2::{Digest, Sha384};
 use x509_cert::Certificate;
@@ -65,8 +66,8 @@ pub fn verify_nitro_attestation(
     // Decode hex input
     let document_bytes = hex::decode(document_hex)?;
 
-    // Parse the COSE Sign1 structure
-    let cose_sign1 = CoseSign1::from_tagged_slice(&document_bytes)
+    // Parse the COSE Sign1 structure (NSM returns untagged COSE)
+    let cose_sign1 = CoseSign1::from_slice(&document_bytes)
         .map_err(|e| VerifyError::CoseVerify(format!("Failed to parse COSE Sign1: {}", e)))?;
 
     // Extract the payload
@@ -247,15 +248,27 @@ fn extract_cbor_byte_array(
     Err(VerifyError::CborParse(format!("Missing field: {}", key)))
 }
 
-/// Maximum valid PCR index for AWS Nitro (0-15, with some reserved)
-/// AWS Nitro Enclaves use PCRs 0-15, though typically only 0-8 are populated
-const MAX_NITRO_PCR_INDEX: u8 = 15;
+/// Maximum valid PCR index for AWS Nitro Enclaves (0-15)
+const MAX_NITRO_ENCLAVE_PCR_INDEX: u8 = 15;
+
+/// Maximum valid PCR index for TPMs (0-23)
+const MAX_TPM_PCR_INDEX: u8 = 23;
 
 /// Extract PCRs from CBOR map
+/// Handles both "pcrs" (Nitro Enclave) and "nitrotpm_pcrs" (Nitro TPM) field names
 fn extract_cbor_pcrs(map: &[(CborValue, CborValue)]) -> Result<BTreeMap<u8, String>, VerifyError> {
     for (k, v) in map {
         if let CborValue::Text(k_text) = k {
-            if k_text == "pcrs" {
+            // Check for both field names: "pcrs" (enclave) and "nitrotpm_pcrs" (TPM)
+            let (is_pcrs, max_index) = if k_text == "pcrs" {
+                (true, MAX_NITRO_ENCLAVE_PCR_INDEX)
+            } else if k_text == "nitrotpm_pcrs" {
+                (true, MAX_TPM_PCR_INDEX)
+            } else {
+                (false, 0)
+            };
+
+            if is_pcrs {
                 if let CborValue::Map(pcr_map) = v {
                     let mut pcrs = BTreeMap::new();
                     for (pk, pv) in pcr_map {
@@ -269,9 +282,9 @@ fn extract_cbor_pcrs(map: &[(CborValue, CborValue)]) -> Result<BTreeMap<u8, Stri
                                         format!("Negative PCR index: {}", idx_i128)
                                     ));
                                 }
-                                if idx_i128 > MAX_NITRO_PCR_INDEX as i128 {
+                                if idx_i128 > max_index as i128 {
                                     return Err(VerifyError::PcrIndexOutOfBounds(
-                                        format!("PCR index {} exceeds maximum {}", idx_i128, MAX_NITRO_PCR_INDEX)
+                                        format!("PCR index {} exceeds maximum {}", idx_i128, max_index)
                                     ));
                                 }
 
@@ -284,7 +297,7 @@ fn extract_cbor_pcrs(map: &[(CborValue, CborValue)]) -> Result<BTreeMap<u8, Stri
             }
         }
     }
-    Err(VerifyError::CborParse("Missing pcrs field".into()))
+    Err(VerifyError::CborParse("Missing pcrs or nitrotpm_pcrs field".into()))
 }
 
 /// Verify COSE Sign1 signature
@@ -293,8 +306,6 @@ fn verify_cose_signature(
     public_key: &[u8],
     payload: &[u8],
 ) -> Result<(), VerifyError> {
-    use p384::ecdsa::{Signature, VerifyingKey};
-
     // Nitro uses ES384 (ECDSA with P-384 and SHA-384)
     // Build the Sig_structure for COSE_Sign1:
     // Sig_structure = [
@@ -323,7 +334,7 @@ fn verify_cose_signature(
     let digest = Sha384::digest(&sig_structure_bytes);
 
     // Parse the public key
-    let verifying_key = VerifyingKey::from_sec1_bytes(public_key)
+    let verifying_key = P384VerifyingKey::from_sec1_bytes(public_key)
         .map_err(|e| VerifyError::CoseVerify(format!("Invalid P-384 key: {}", e)))?;
 
     // Parse the signature (raw r||s format for COSE, not DER)
@@ -336,7 +347,7 @@ fn verify_cose_signature(
     }
 
     // Convert raw r||s to DER format for the ecdsa crate
-    let signature = Signature::from_slice(sig_bytes)
+    let signature = P384Signature::from_slice(sig_bytes)
         .map_err(|e| VerifyError::CoseVerify(format!("Invalid signature: {}", e)))?;
 
     verifying_key

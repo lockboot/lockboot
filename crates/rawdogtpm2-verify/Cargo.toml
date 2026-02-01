@@ -38,3 +38,11 @@ serde_json = { workspace = true }
 [lib]
 name = "rawdogtpm2_verify"
 path = "src/lib.rs"
+
+[[bin]]
+name = "selftest-verify"
+path = "src/bin/selftest-verify.rs"
+
+[[bin]]
+name = "test-verify"
+path = "src/bin/test-verify.rs"

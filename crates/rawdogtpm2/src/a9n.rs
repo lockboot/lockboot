@@ -4,7 +4,7 @@
 //!
 //! Provides high-level attestation operations including:
 //! - Retrieving EK certificates from NV RAM
-//! - Creating and certifying attestation keys
+//! - Creating and certifying attestation keys (AK)
 //! - Reading PCR values
 //! - Generating attestation documents
 
@@ -12,10 +12,10 @@ use anyhow::{anyhow, Context, Result};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, BTreeMap};
-use sha2::{Sha256, Digest};
 
 use crate::{Tpm, EkOps, NvOps, PcrOps, NsmOps, TPM_RH_OWNER};
 use crate::{NV_INDEX_RSA_2048_EK_CERT, NV_INDEX_ECC_P256_EK_CERT, NV_INDEX_ECC_P384_EK_CERT};
+use crate::credential::compute_ecc_p256_name;
 
 /// Complete attestation output containing all TPM attestation data
 #[derive(Debug, Serialize, Deserialize)]
@@ -53,10 +53,16 @@ pub struct AttestationContainer {
     pub nitro: Option<NitroAttestationData>,
 }
 
-/// TPM attestation data (certify response)
+/// TPM attestation data (certify response with NIZK proof)
 #[derive(Debug, Serialize, Deserialize)]
 pub struct AttestationData {
+    /// The nonce/challenge provided to the attestation (hex-encoded)
+    /// This is duplicated from attest_data.extraData for easy access.
+    /// Verification MUST check this matches the nonce in attest_data.
+    pub nonce: String,
+    /// TPM2B_ATTEST structure from TPM2_Certify (hex-encoded)
     pub attest_data: String,
+    /// ECDSA signature over attest_data (DER, hex-encoded)
     pub signature: String,
 }
 
@@ -68,15 +74,15 @@ pub struct NitroAttestationData {
     pub document: String,
 }
 
-/// Convert DER-encoded certificate to PEM format
-fn der_to_pem(der: &[u8], label: &str) -> String {
+/// Convert DER-encoded data to PEM format
+pub fn der_to_pem(der: &[u8], label: &str) -> String {
     let base64_encoded = STANDARD.encode(der);
     let mut pem = format!("-----BEGIN {}-----\n", label);
     for chunk in base64_encoded.as_bytes().chunks(64) {
         pem.push_str(std::str::from_utf8(chunk).unwrap());
         pem.push('\n');
     }
-    pem.push_str(&format!("-----END {}-----", label));
+    pem.push_str(&format!("-----END {}-----\n", label));
     pem
 }
 
@@ -149,18 +155,22 @@ pub fn attest(nonce: &[u8]) -> Result<String> {
         pcr_map.insert(*index, hex::encode(value));
     }
 
-    // Step 4: Get all unique PCR indices for policy
-    let mut pcr_indices: Vec<u8> = all_pcrs.iter().map(|(idx, _, _)| *idx).collect();
-    pcr_indices.sort_unstable();
-    pcr_indices.dedup();
+    // Step 4: Get SHA-256 PCR values from what we already read
+    // Use values from all_pcrs (which reads one at a time correctly)
+    let sha256_pcr_values: Vec<(u8, Vec<u8>)> = all_pcrs.iter()
+        .filter(|(_, alg, _)| *alg == crate::TpmAlg::Sha256)
+        .map(|(idx, _, val)| (*idx, val.clone()))
+        .collect();
 
-    // Use the algorithm from the first PCR (typically SHA-256)
-    let bank_alg = all_pcrs.first()
-        .map(|(_, alg, _)| *alg)
-        .ok_or_else(|| anyhow!("No PCRs found"))?;
+    if sha256_pcr_values.is_empty() {
+        return Err(anyhow!("No SHA-256 PCRs allocated on this TPM"));
+    }
 
-    // Create signing key (AK) bound to current PCR values
-    let signing_key = tpm.create_primary_ecc_key_with_pcr_policy(TPM_RH_OWNER, &pcr_indices, bank_alg)?;
+    // Compute policy from SHA-256 PCR values
+    let auth_policy = Tpm::calculate_pcr_policy_digest(&sha256_pcr_values)?;
+
+    // Create signing key (AK) bound to this policy
+    let signing_key = tpm.create_primary_ecc_key_with_policy(TPM_RH_OWNER, &auth_policy)?;
 
     let mut signing_key_public_keys = HashMap::new();
     signing_key_public_keys.insert("ecc_p256".to_string(), EkPublicKey {
@@ -168,20 +178,23 @@ pub fn attest(nonce: &[u8]) -> Result<String> {
         y: hex::encode(&signing_key.public_key.y),
     });
 
-    // Step 5: Sign the nonce with the signing key (AK)
-    // The AK can only sign when PCRs match its policy, proving the PCR state.
-    // We sign the SHA-256 hash of the nonce (TPM expects 32-byte digest for signing)
-    let nonce_digest = Sha256::digest(nonce);
-    let signature = tpm.sign(signing_key.handle, &nonce_digest)?;
+    // Compute AK name (used for PCR policy verification)
+    let _ak_name = compute_ecc_p256_name(
+        &signing_key.public_key.x,
+        &signing_key.public_key.y,
+        &auth_policy,
+    );
 
-    // Build attestation data - we include the nonce as the "attest_data"
-    // and the signature over its hash as the "signature"
-    let cert_result = crate::CertifyResult {
-        attest_data: nonce.to_vec(),
-        signature,
-    };
+    // Step 6: AK self-certifies via TPM2_Certify
+    // This produces TPM2B_ATTEST containing the AK's name (which includes authPolicy)
+    let cert_result = tpm.certify(
+        signing_key.handle,  // object to certify (AK itself)
+        signing_key.handle,  // signing key (AK)
+        nonce,               // qualifying data (becomes extraData in TPM2B_ATTEST)
+    )?;
 
     let attestation_data = AttestationData {
+        nonce: hex::encode(nonce),
         attest_data: hex::encode(&cert_result.attest_data),
         signature: hex::encode(&cert_result.signature),
     };

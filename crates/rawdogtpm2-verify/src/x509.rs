@@ -4,6 +4,9 @@
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use der::{Decode, Encode};
+use ecdsa::signature::Verifier;
+use p256::ecdsa::{Signature as P256Signature, VerifyingKey as P256VerifyingKey};
+use p384::ecdsa::{Signature as P384Signature, VerifyingKey as P384VerifyingKey};
 use pki_types::{CertificateDer, UnixTime};
 use webpki::{anchor_from_trusted_cert, EndEntityCert, KeyUsage};
 use sha2::{Digest, Sha256};
@@ -235,6 +238,148 @@ pub fn parse_and_validate_cert_chain(
 ) -> Result<ChainValidationResult, VerifyError> {
     let certs = parse_cert_chain_pem(chain_pem)?;
     validate_cert_chain(&certs, time)
+}
+
+/// Validate TPM EK certificate chain
+///
+/// Similar to validate_cert_chain but without Extended Key Usage (EKU) checking.
+/// TPM EK certificates use TPM-specific EKU OID (2.23.133.8.1) which is not
+/// recognized by webpki's standard EKU validation.
+///
+/// This function validates:
+/// - Each certificate is signed by the next in chain
+/// - Certificate validity periods include the specified time
+/// - Chain is not too deep
+///
+/// Chain should be leaf-first, root-last.
+pub fn validate_tpm_cert_chain(
+    chain: &[Certificate],
+    time: UnixTime,
+) -> Result<ChainValidationResult, VerifyError> {
+    if chain.is_empty() {
+        return Err(VerifyError::ChainValidation("Empty certificate chain".into()));
+    }
+    if chain.len() > MAX_CHAIN_DEPTH {
+        return Err(VerifyError::ChainValidation(format!(
+            "Certificate chain too deep: {} certificates (max {})",
+            chain.len(),
+            MAX_CHAIN_DEPTH
+        )));
+    }
+
+    // Validate each certificate is signed by the next one in chain
+    for i in 0..chain.len() - 1 {
+        let cert = &chain[i];
+        let issuer = &chain[i + 1];
+
+        // Get issuer's public key
+        let issuer_pubkey = extract_public_key(issuer)?;
+
+        // Get the TBS (to be signed) certificate bytes
+        let tbs_der = cert.tbs_certificate.to_der()
+            .map_err(|e| VerifyError::ChainValidation(format!("Failed to encode TBS: {}", e)))?;
+
+        // Get the signature
+        let sig_bytes = cert.signature.raw_bytes();
+
+        // Determine algorithm and verify
+        let alg_oid = &cert.signature_algorithm.oid;
+
+        // ECDSA with SHA-256 on P-256: 1.2.840.10045.4.3.2
+        // ECDSA with SHA-384 on P-384: 1.2.840.10045.4.3.3
+        const ECDSA_SHA256_OID: &str = "1.2.840.10045.4.3.2";
+        const ECDSA_SHA384_OID: &str = "1.2.840.10045.4.3.3";
+
+        let alg_str = alg_oid.to_string();
+        match alg_str.as_str() {
+            ECDSA_SHA256_OID => {
+                // P-256 verification
+                if issuer_pubkey.len() != 65 || issuer_pubkey[0] != 0x04 {
+                    return Err(VerifyError::ChainValidation(
+                        "Invalid issuer public key format for P-256".into()
+                    ));
+                }
+                let verifying_key = P256VerifyingKey::from_sec1_bytes(&issuer_pubkey)
+                    .map_err(|e| VerifyError::ChainValidation(format!("Invalid P-256 key: {}", e)))?;
+
+                let signature = P256Signature::from_der(sig_bytes)
+                    .map_err(|e| VerifyError::ChainValidation(format!("Invalid P-256 signature: {}", e)))?;
+
+                verifying_key.verify(&tbs_der, &signature)
+                    .map_err(|_| VerifyError::ChainValidation(
+                        format!("Certificate {} signature verification failed", i)
+                    ))?;
+            }
+            ECDSA_SHA384_OID => {
+                // P-384 verification
+                if issuer_pubkey.len() != 97 || issuer_pubkey[0] != 0x04 {
+                    return Err(VerifyError::ChainValidation(
+                        "Invalid issuer public key format for P-384".into()
+                    ));
+                }
+                let verifying_key = P384VerifyingKey::from_sec1_bytes(&issuer_pubkey)
+                    .map_err(|e| VerifyError::ChainValidation(format!("Invalid P-384 key: {}", e)))?;
+
+                let signature = P384Signature::from_der(sig_bytes)
+                    .map_err(|e| VerifyError::ChainValidation(format!("Invalid P-384 signature: {}", e)))?;
+
+                verifying_key.verify(&tbs_der, &signature)
+                    .map_err(|_| VerifyError::ChainValidation(
+                        format!("Certificate {} signature verification failed", i)
+                    ))?;
+            }
+            _ => {
+                return Err(VerifyError::ChainValidation(format!(
+                    "Unsupported signature algorithm: {}",
+                    alg_str
+                )));
+            }
+        }
+    }
+
+    // Validate time for each certificate
+    let unix_secs = time.as_secs();
+
+    for (i, cert) in chain.iter().enumerate() {
+        let validity = &cert.tbs_certificate.validity;
+
+        // Convert not_before and not_after to unix timestamps
+        let not_before = validity.not_before.to_unix_duration().as_secs();
+        let not_after = validity.not_after.to_unix_duration().as_secs();
+
+        if unix_secs < not_before {
+            return Err(VerifyError::ChainValidation(format!(
+                "Certificate {} is not yet valid",
+                i
+            )));
+        }
+        if unix_secs > not_after {
+            return Err(VerifyError::ChainValidation(format!(
+                "Certificate {} has expired",
+                i
+            )));
+        }
+    }
+
+    // Extract and hash root's public key
+    let root_pubkey = extract_public_key(&chain[chain.len() - 1])?;
+    let root_hash = hash_public_key(&root_pubkey);
+
+    Ok(ChainValidationResult {
+        root_pubkey_hash: root_hash,
+    })
+}
+
+/// Parse PEM and validate TPM certificate chain
+///
+/// Convenience wrapper that parses PEM then validates without EKU checking.
+/// Chain should be leaf-first, root-last in the PEM.
+pub fn parse_and_validate_tpm_cert_chain(
+    chain_pem: &str,
+    time: UnixTime,
+) -> Result<ChainValidationResult, VerifyError> {
+    let certs = parse_cert_chain_pem(chain_pem)?;
+    validate_tpm_cert_chain(&certs, time)
 }
 
 #[cfg(test)]

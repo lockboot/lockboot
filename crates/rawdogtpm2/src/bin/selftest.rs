@@ -5,8 +5,15 @@
 //! Connects to the local TPM and runs basic functionality tests
 
 use anyhow::Result;
-use rawdogtpm2::{Tpm, TpmAlg, TPM_RH_OWNER, TPM_RH_ENDORSEMENT, NV_INDEX_RSA_2048_EK_CERT, NV_INDEX_ECC_P256_EK_CERT, NV_INDEX_ECC_P384_EK_CERT};
-use rawdogtpm2::{EkOps, PcrOps, NvOps};
+use hex;
+use sha2::{Sha256, Digest};
+
+use rawdogtpm2::{
+    Tpm, TpmAlg, TPM_RH_OWNER, TPM_RH_ENDORSEMENT,
+    NV_INDEX_RSA_2048_EK_CERT, NV_INDEX_ECC_P256_EK_CERT, NV_INDEX_ECC_P384_EK_CERT,
+    EkOps, PcrOps, NvOps,
+    compute_ecc_p256_name, der_to_pem,
+};
 
 // TPM fixed property identifiers (TPM_PT)
 const TPM_PT_FAMILY_INDICATOR: u32 = 0x00000100;
@@ -174,7 +181,7 @@ fn standard_tests() -> Result<()> {
         println!("No non-zero PCRs found (all PCRs are zero in all banks)");
     } else {
         for (index, alg, value) in &pcrs {
-            println!("PCR {:2} [{}]: {}", index, alg.name(), hex_encode(value));
+            println!("PCR {:2} [{}]: {}", index, alg.name(), hex::encode(value));
         }
     }
 
@@ -200,7 +207,7 @@ fn standard_tests() -> Result<()> {
     println!("\nPCR 23 values BEFORE extension:");
     let pcr23_before = tpm.pcr_read_all_banks(&[23])?;
     for (_index, alg, value) in &pcr23_before {
-        println!("  [{}]: {}", alg.name(), hex_encode(value));
+        println!("  [{}]: {}", alg.name(), hex::encode(value));
     }
 
     // Extend PCR 23 with all allocated banks
@@ -215,7 +222,7 @@ fn standard_tests() -> Result<()> {
     println!("\nPCR 23 values AFTER extension:");
     let pcr23_after = tpm.pcr_read_all_banks(&[23])?;
     for (_index, alg, value) in &pcr23_after {
-        println!("  [{}]: {}", alg.name(), hex_encode(value));
+        println!("  [{}]: {}", alg.name(), hex::encode(value));
     }
 
     // Verify the value changed
@@ -232,21 +239,21 @@ fn standard_tests() -> Result<()> {
     let key_result = tpm.create_primary_ecc_key(TPM_RH_OWNER)?;
     println!("✓ Primary key created");
     println!("  Handle: 0x{:08X}", key_result.handle);
-    println!("  Public X: {}", hex_encode(&key_result.public_key.x));
-    println!("  Public Y: {}", hex_encode(&key_result.public_key.y));
+    println!("  Public X: {}", hex::encode(&key_result.public_key.x));
+    println!("  Public Y: {}", hex::encode(&key_result.public_key.y));
     println!();
 
     // Test 4: Sign data
     println!("Test 4: Signing test data");
     println!("-------------------------");
     let test_data = b"Hello, TPM!";
-    let digest = sha256(test_data);
+    let digest = Sha256::digest(test_data);
     println!("Test data: {:?}", std::str::from_utf8(test_data).unwrap());
-    println!("SHA256 digest: {}", hex_encode(&digest));
+    println!("SHA256 digest: {}", hex::encode(&digest));
 
     let signature = tpm.sign(key_result.handle, &digest)?;
     println!("✓ Signature created (DER-encoded)");
-    println!("  Signature ({} bytes): {}", signature.len(), hex_encode(&signature));
+    println!("  Signature ({} bytes): {}", signature.len(), hex::encode(&signature));
     println!();
 
     // Test 5: Check for Endorsement Key
@@ -256,8 +263,8 @@ fn standard_tests() -> Result<()> {
         Ok(ek_result) => {
             println!("✓ EK created/accessed in endorsement hierarchy");
             println!("  EK Handle: 0x{:08X}", ek_result.handle);
-            println!("  EK Public X: {}", hex_encode(&ek_result.public_key.x));
-            println!("  EK Public Y: {}", hex_encode(&ek_result.public_key.y));
+            println!("  EK Public X: {}", hex::encode(&ek_result.public_key.x));
+            println!("  EK Public Y: {}", hex::encode(&ek_result.public_key.y));
 
             // Flush EK
             tpm.flush_context(ek_result.handle)?;
@@ -300,7 +307,7 @@ fn standard_tests() -> Result<()> {
                 decode_nv_attributes(info.attributes, 4);
                 println!("  Auth Policy:    {} bytes", info.auth_policy.len());
                 if !info.auth_policy.is_empty() {
-                    println!("    {}", hex_encode(&info.auth_policy));
+                    println!("    {}", hex::encode(&info.auth_policy));
                 }
                 println!("  Data Size:      {} bytes", info.data_size);
 
@@ -336,26 +343,28 @@ fn standard_tests() -> Result<()> {
     println!("Sealing to ALL {} allocated PCR values:", all_pcrs.len());
 
     for (index, alg, value) in &all_pcrs {
-        println!("  PCR {:2} [{}]: {}", index, alg.name(), hex_encode(value));
+        println!("  PCR {:2} [{}]: {}", index, alg.name(), hex::encode(value));
     }
 
-    // Get unique PCR indices and pick the first bank we find
-    let mut pcr_indices: Vec<u8> = all_pcrs.iter().map(|(idx, _, _)| *idx).collect();
-    pcr_indices.sort_unstable();
-    pcr_indices.dedup();
+    // Get SHA-256 PCR values (must use SHA-256 for consistency with verification)
+    let pcr_values: Vec<(u8, Vec<u8>)> = all_pcrs.iter()
+        .filter(|(_, alg, _)| *alg == TpmAlg::Sha256)
+        .map(|(idx, _, val)| (*idx, val.clone()))
+        .collect();
 
-    // Use the bank of the first PCR we found
-    let bank_alg = all_pcrs.first()
-        .map(|(_, alg, _)| *alg)
-        .unwrap_or(TpmAlg::Sha256);
+    if pcr_values.is_empty() {
+        anyhow::bail!("No SHA-256 PCRs allocated on this TPM");
+    }
 
-    println!("\nCreating key sealed to {} PCRs {:?} using {} bank", pcr_indices.len(), pcr_indices, bank_alg.name());
+    println!("\nCreating key sealed to {} SHA-256 PCRs", pcr_values.len());
 
-    let sealed_key = tpm.create_primary_ecc_key_with_pcr_policy(TPM_RH_OWNER, &pcr_indices, bank_alg)?;
+    // Compute policy from the PCR values we already have
+    let auth_policy = Tpm::calculate_pcr_policy_digest(&pcr_values)?;
+    let sealed_key = tpm.create_primary_ecc_key_with_policy(TPM_RH_OWNER, &auth_policy)?;
     println!("✓ PCR-sealed key created");
     println!("  Handle: 0x{:08X}", sealed_key.handle);
-    println!("  Public X: {}", hex_encode(&sealed_key.public_key.x));
-    println!("  Public Y: {}", hex_encode(&sealed_key.public_key.y));
+    println!("  Public X: {}", hex::encode(&sealed_key.public_key.x));
+    println!("  Public Y: {}", hex::encode(&sealed_key.public_key.y));
 
     // Test 8: Certify the PCR-sealed key with the EK
     println!("\nTest 8: Certifying PCR-sealed key with EK");
@@ -404,11 +413,121 @@ fn standard_tests() -> Result<()> {
         println!("  Saved signature to: /tmp/attestation_signature.der");
     }
 
-    // Cleanup
+    // Cleanup EK and sealed key (but keep key_result for more tests)
     tpm.flush_context(ek.handle)?;
     tpm.flush_context(sealed_key.handle)?;
+
+    // Test 9: Standard EK creation
+    println!("\nTest 9: Standard EK Creation (TCG Template)");
+    println!("--------------------------------------------");
+
+    // Try to create the TCG standard EK
+    match tpm.create_standard_ek() {
+        Ok(standard_ek) => {
+            println!("✓ Standard EK created using TCG EK Credential Profile template");
+            println!("  Handle: 0x{:08X}", standard_ek.handle);
+            println!("  Public X: {}", hex::encode(&standard_ek.public_key.x));
+            println!("  Public Y: {}", hex::encode(&standard_ek.public_key.y));
+            println!("  Note: Certificate comparison requires rawdogtpm2-verify selftest");
+
+            tpm.flush_context(standard_ek.handle)?;
+        }
+        Err(e) => {
+            println!("⚠ Could not create standard EK: {}", e);
+            println!("  (Endorsement hierarchy may require authentication)");
+        }
+    }
+    println!();
+
+    // Test 10: ReadPublic and name verification
+    println!("Test 10: ReadPublic and Name Verification");
+    println!("------------------------------------------");
+
+    let read_result = tpm.read_public(key_result.handle)?;
+    println!("ReadPublic returned:");
+    println!("  Public area: {} bytes", read_result.public_area.len());
+    println!("  Name: {}", hex::encode(&read_result.name));
+
+    // Compute expected name and compare
+    // For our signing key, authPolicy is empty
+    let computed_name = compute_ecc_p256_name(
+        &key_result.public_key.x,
+        &key_result.public_key.y,
+        &[], // empty policy for basic signing key
+    );
+    println!("  Computed name: {}", hex::encode(&computed_name));
+
+    if read_result.name == computed_name {
+        println!("✓ TPM's name matches our computed name");
+    } else {
+        println!("⚠ Name mismatch - TPM uses different computation");
+        println!("  (This is expected if key has non-empty authPolicy)");
+    }
+    println!();
+
+    // Test 11: Policy session operations
+    println!("Test 11: Policy Session Operations");
+    println!("-----------------------------------");
+
+    // Start a policy session
+    let policy_session = tpm.start_policy_session()?;
+    println!("✓ Policy session started: 0x{:08X}", policy_session);
+
+    // Get initial policy digest (should be all zeros)
+    let initial_digest = tpm.policy_get_digest(policy_session)?;
+    println!("  Initial policy digest: {}", hex::encode(&initial_digest));
+
+    let expected_empty = vec![0u8; 32];
+    if initial_digest == expected_empty {
+        println!("✓ Initial digest is empty (all zeros) as expected");
+    } else {
+        println!("⚠ Initial digest is not empty - unexpected");
+    }
+
+    // Execute PolicySecret(TPM_RH_ENDORSEMENT)
+    println!("\nExecuting PolicySecret(TPM_RH_ENDORSEMENT)...");
+    match tpm.policy_secret(policy_session, TPM_RH_ENDORSEMENT) {
+        Ok(()) => {
+            println!("✓ PolicySecret executed successfully");
+
+            // Get updated policy digest
+            let updated_digest = tpm.policy_get_digest(policy_session)?;
+            println!("  Updated policy digest: {}", hex::encode(&updated_digest));
+
+            // Expected digest for PolicySecret(TPM_RH_ENDORSEMENT) with SHA-256
+            // This is the standard EK authPolicy
+            let expected_ek_policy: [u8; 32] = [
+                0x83, 0x71, 0x97, 0x67, 0x44, 0x84, 0xB3, 0xF8,
+                0x1A, 0x90, 0xCC, 0x8D, 0x46, 0xA5, 0xD7, 0x24,
+                0xFD, 0x52, 0xD7, 0x6E, 0x06, 0x52, 0x0B, 0x64,
+                0xF2, 0xA1, 0xDA, 0x1B, 0x33, 0x14, 0x69, 0xAA,
+            ];
+            println!("  Expected EK policy:    {}", hex::encode(&expected_ek_policy));
+
+            if updated_digest == expected_ek_policy {
+                println!("✓ Policy digest matches standard EK authPolicy!");
+            } else {
+                println!("⚠ Policy digest does not match expected value");
+            }
+        }
+        Err(e) => {
+            println!("⚠ PolicySecret failed: {}", e);
+            println!("  (This is normal if endorsement hierarchy requires authentication)");
+        }
+    }
+
+    // Flush policy session
+    tpm.flush_context(policy_session)?;
+    println!("✓ Policy session flushed");
+
+    println!();
+
     // Cleanup: Flush the signing key handle
     tpm.flush_context(key_result.handle)?;
+
+    println!("======================");
+    println!("All tests completed!");
+    println!("======================");
     Ok(())
 }
 
@@ -448,7 +567,7 @@ fn check_ek_cert(tpm: &mut Tpm, nv_index: u32, description: &str, filename_base:
                     println!("\n{}", pem);
                 } else {
                     println!("  Format: Unknown (not standard DER)");
-                    println!("  First 32 bytes: {}", hex_encode(&cert[..cert.len().min(32)]));
+                    println!("  First 32 bytes: {}", hex::encode(&cert[..cert.len().min(32)]));
                 }
             }
         }
@@ -457,38 +576,6 @@ fn check_ek_cert(tpm: &mut Tpm, nv_index: u32, description: &str, filename_base:
             println!("  Error: {}", e);
         }
     }
-}
-
-/// Simple SHA-256 hash function
-fn sha256(data: &[u8]) -> [u8; 32] {
-    use sha2::{Sha256, Digest};
-    let mut hasher = Sha256::new();
-    hasher.update(data);
-    hasher.finalize().into()
-}
-
-/// Helper function to encode bytes as hex string
-fn hex_encode(bytes: &[u8]) -> String {
-    bytes.iter()
-        .map(|b| format!("{:02x}", b))
-        .collect::<String>()
-}
-
-/// Convert DER-encoded data to PEM format
-fn der_to_pem(der: &[u8], label: &str) -> String {
-    use base64::{engine::general_purpose::STANDARD, Engine as _};
-
-    let base64_encoded = STANDARD.encode(der);
-
-    // Format as PEM with 64 character lines
-    let mut pem = format!("-----BEGIN {}-----\n", label);
-    for chunk in base64_encoded.as_bytes().chunks(64) {
-        pem.push_str(std::str::from_utf8(chunk).unwrap());
-        pem.push('\n');
-    }
-    pem.push_str(&format!("-----END {}-----\n", label)); // Add trailing newline
-
-    pem
 }
 
 /// Decode NV index attributes bitfield

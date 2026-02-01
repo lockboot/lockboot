@@ -10,6 +10,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 
 pub mod a9n;
+pub mod credential;
 pub mod ek;
 pub mod nsm;
 pub mod nv;
@@ -21,7 +22,13 @@ pub use nsm::NsmOps;
 pub use nv::NvOps;
 pub use pcr::PcrOps;
 
-pub use a9n::attest;
+// Re-export credential functions
+pub use credential::{
+    compute_ecc_p256_name,
+    ReadPublicResult,
+};
+
+pub use a9n::{attest, der_to_pem};
 
 /// TPM 2.0 command codes
 #[repr(u32)]
@@ -40,8 +47,13 @@ pub enum TpmCc {
     NvWrite = 0x00000137,
     NvUndefineSpace = 0x00000122,
     PolicyPCR = 0x0000017F,
+    PolicySecret = 0x00000151,
+    PolicyGetDigest = 0x00000189,
     Certify = 0x00000148,
+    ActivateCredential = 0x00000147,
+    MakeCredential = 0x00000168,
     StartAuthSession = 0x00000176,
+    ReadPublic = 0x00000173,
 }
 
 /// TPM 2.0 structure tags

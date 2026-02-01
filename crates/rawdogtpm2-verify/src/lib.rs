@@ -22,17 +22,22 @@ pub use error::VerifyError;
 
 // Re-export TPM types and functions
 pub use tpm::{
-    calculate_pcr_policy, verify_ecdsa_p256, verify_pcr_policy, verify_tpm_attestation,
-    TpmVerifyResult,
+    calculate_pcr_policy, parse_tpm2b_attest, verify_ecdsa_p256,
+    verify_pcr_policy, verify_tpm_attestation,
+    verify_tpm_signature_only, TpmAttestInfo,
 };
+
+// Re-export from rawdogtpm2 (single source of truth for TPM crypto)
+pub use rawdogtpm2::compute_ecc_p256_name;
 
 // Re-export Nitro types and functions
 pub use nitro::{verify_nitro_attestation, NitroDocument, NitroVerifyResult};
 
 // Re-export X.509 utility functions
 pub use x509::{
-    extract_public_key, hash_public_key, parse_and_validate_cert_chain, parse_cert_chain_pem,
-    validate_cert_chain, ChainValidationResult, MAX_CHAIN_DEPTH,
+    extract_public_key, hash_public_key, parse_and_validate_cert_chain,
+    parse_and_validate_tpm_cert_chain, parse_cert_chain_pem, validate_cert_chain,
+    validate_tpm_cert_chain, ChainValidationResult, MAX_CHAIN_DEPTH,
 };
 
 // Re-export time type for testing
@@ -44,109 +49,218 @@ pub use rawdogtpm2::a9n::{
     NitroAttestationData,
 };
 
-/// Summary of verification for an entire AttestationOutput
+/// How the attestation was verified
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum VerificationMethod {
+    /// Verified via AWS Nitro attestation
+    Nitro,
+    /// Verified via cloud provider AK certificate chain (GCP/Azure)
+    /// Note: Not yet implemented - reserved for future use
+    #[allow(dead_code)]
+    CloudAkChain,
+}
+
+/// Result of successful attestation verification
 #[derive(Debug, Serialize)]
-pub struct VerificationSummary {
-    /// TPM verification results by key type
-    pub tpm: BTreeMap<String, TpmVerifyResult>,
-    /// Nitro verification result (if present)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub nitro: Option<NitroVerifyResult>,
+pub struct VerificationResult {
+    /// The nonce that was verified (hex-encoded)
+    pub nonce: String,
+    /// SHA-256 hash of the root CA's public key
+    pub root_pubkey_hash: String,
+    /// How the attestation was verified
+    pub method: VerificationMethod,
 }
 
 /// Verify an entire AttestationOutput
 ///
-/// Verifies all TPM attestations and the Nitro attestation (if present).
-/// For TPM attestations, this verifies:
-/// 1. EK public key from attestation matches the certificate's EK public key
-/// 2. AK signature over the nonce is valid
-/// 3. Certificate chain validates to root CA
+/// Currently supports one verification path:
+///
+/// 1. **Nitro path** (AWS): If Nitro attestation is present, verify it and trust
+///    the TPM signing key via the Nitro document's `public_key` binding. The
+///    TPM2B_ATTEST structure is verified for PCR policy binding. EK certificates
+///    are not required in this path.
+///
+/// Future paths (not yet implemented):
+/// - **GCP Shielded VM**: AK certificate from Google CA (NV index 0x01c10000)
+/// - **Azure Trusted Launch**: AK certificate from Microsoft CA (NV index 0x01C101D0)
+///
+/// # Returns
+/// A unified `VerificationResult` containing:
+/// - `nonce`: The verified challenge (from TPM2B_ATTEST.extraData)
+/// - `root_pubkey_hash`: SHA-256 of the trust anchor's public key
+/// - `method`: How verification was performed
 ///
 /// # Errors
-/// Returns `NoValidAttestation` if:
-/// - There are TPM attestations but none could be verified (missing certs/keys)
-/// - An attestation references an unknown key type
+/// Returns `NoValidAttestation` if no supported verification path is available.
 pub fn verify_attestation_output(
     output: &AttestationOutput,
-) -> Result<VerificationSummary, VerifyError> {
-    let mut tpm_results = BTreeMap::new();
-    let mut skipped: Vec<String> = Vec::new();
-
-    // Verify each TPM attestation
-    for (key_type, attestation) in &output.attestation.tpm {
-        // Get the corresponding EK certificate
-        let ek_cert = match key_type.as_str() {
-            "rsa_2048" => output.ek_certificates.rsa_2048.as_ref(),
-            "ecc_p256" => output.ek_certificates.ecc_p256.as_ref(),
-            "ecc_p384" => output.ek_certificates.ecc_p384.as_ref(),
-            _ => {
-                return Err(VerifyError::NoValidAttestation(format!(
-                    "unknown key type '{}' in attestation",
-                    key_type
-                )));
-            }
-        };
-
-        // Get the corresponding EK public key from attestation output
-        let ek_pubkey = output.ek_public_keys.get(key_type);
-
-        // Get the corresponding signing key (AK) public key
-        let ak_pubkey = output.signing_key_public_keys.get(key_type);
-
-        // All three must be present - track what's missing
-        let missing: Vec<&str> = [
-            ek_cert.is_none().then_some("EK certificate"),
-            ek_pubkey.is_none().then_some("EK public key"),
-            ak_pubkey.is_none().then_some("AK public key"),
-        ]
-        .into_iter()
-        .flatten()
-        .collect();
-
-        if !missing.is_empty() {
-            skipped.push(format!("{}: missing {}", key_type, missing.join(", ")));
-            continue;
-        }
-
-        let (cert_pem, ek_pk, ak_pk) = (
-            ek_cert.unwrap(),
-            ek_pubkey.unwrap(),
-            ak_pubkey.unwrap(),
-        );
-
-        let result = verify_tpm_attestation(
-            &attestation.attest_data,
-            &attestation.signature,
-            &ak_pk.x,
-            &ak_pk.y,
-            &ek_pk.x,
-            &ek_pk.y,
-            cert_pem,
-        )?;
-        tpm_results.insert(key_type.clone(), result);
+) -> Result<VerificationResult, VerifyError> {
+    // Must have at least one TPM attestation
+    if output.attestation.tpm.is_empty() {
+        return Err(VerifyError::NoValidAttestation(
+            "no TPM attestations present".into(),
+        ));
     }
 
-    // Fail if there were TPM attestations but none could be verified
-    if !output.attestation.tpm.is_empty() && tpm_results.is_empty() {
-        return Err(VerifyError::NoValidAttestation(format!(
-            "all TPM attestations skipped: {}",
-            skipped.join("; ")
+    // Get the first (and typically only) TPM attestation
+    let (key_type, attestation) = output.attestation.tpm.iter().next().unwrap();
+
+    // Get the corresponding signing key (AK) public key
+    let ak_pk = output.signing_key_public_keys.get(key_type).ok_or_else(|| {
+        VerifyError::NoValidAttestation(format!("{}: missing AK public key", key_type))
+    })?;
+
+    // Decode AK public key
+    let ak_x = hex::decode(&ak_pk.x)
+        .map_err(|e| VerifyError::HexDecode(e))?;
+    let ak_y = hex::decode(&ak_pk.y)
+        .map_err(|e| VerifyError::HexDecode(e))?;
+
+    // Get SHA-256 PCRs for policy verification (required for both paths)
+    let sha256_pcrs: BTreeMap<u8, String> = output
+        .pcrs
+        .get("sha256")
+        .cloned()
+        .unwrap_or_default();
+
+    // Parse TPM2B_ATTEST structure (needed for both paths)
+    let attest_data = hex::decode(&attestation.attest_data)?;
+    let attest_info = parse_tpm2b_attest(&attest_data)?;
+
+    // Verify nonce field matches nonce in attest_data (prevents tampering)
+    let nonce_from_field = hex::decode(&attestation.nonce)?;
+    if nonce_from_field != attest_info.nonce {
+        return Err(VerifyError::InvalidAttest(format!(
+            "Nonce field does not match nonce in attest_data. \
+             Field: {}, Attest: {}",
+            attestation.nonce,
+            hex::encode(&attest_info.nonce)
         )));
     }
 
-    // Verify Nitro attestation if present
-    let nitro_result = if let Some(ref nitro) = output.attestation.nitro {
-        Some(verify_nitro_attestation(
-            &nitro.document,
-            None, // Don't validate nonce here
-            None, // Don't validate pubkey here
-        )?)
-    } else {
-        None
-    };
+    // Verify AK signature over TPM2B_ATTEST
+    let signature = hex::decode(&attestation.signature)?;
+    let mut ak_pubkey = vec![0x04];
+    ak_pubkey.extend(&ak_x);
+    ak_pubkey.extend(&ak_y);
+    verify_ecdsa_p256(&attest_data, &signature, &ak_pubkey)?;
 
-    Ok(VerificationSummary {
-        tpm: tpm_results,
-        nitro: nitro_result,
-    })
+    // Compute authPolicy from PCRs and verify certified name (proves PCR binding)
+    if !sha256_pcrs.is_empty() {
+        let auth_policy_hex = calculate_pcr_policy(&sha256_pcrs)?;
+        let auth_policy = hex::decode(&auth_policy_hex)?;
+
+        let expected_name = compute_ecc_p256_name(&ak_x, &ak_y, &auth_policy);
+        if attest_info.certified_name != expected_name {
+            return Err(VerifyError::InvalidAttest(format!(
+                "Certified key name does not match expected PCR policy. \
+                 AK's authPolicy does not match claimed PCR values. \
+                 Expected name: {}, Got: {}",
+                hex::encode(&expected_name),
+                hex::encode(&attest_info.certified_name)
+            )));
+        }
+    }
+
+    // If Nitro attestation is present, use Nitro path
+    if let Some(ref nitro) = output.attestation.nitro {
+        // Verify Nitro attestation (COSE signature, cert chain)
+        let nitro_result = verify_nitro_attestation(
+            &nitro.document,
+            None, // Nonce validation happens via TPM binding
+            None, // Pubkey validation happens below
+        )?;
+
+        // Verify the AK public key matches Nitro's public_key field
+        let ak_secg = format!("04{}{}", ak_pk.x, ak_pk.y);
+        if ak_secg != nitro.public_key {
+            return Err(VerifyError::SignatureInvalid(format!(
+                "TPM signing key does not match Nitro public_key binding: {} != {}",
+                ak_secg, nitro.public_key
+            )));
+        }
+
+        // Nonce is from TPM2B_ATTEST.extraData
+        return Ok(VerificationResult {
+            nonce: hex::encode(&attest_info.nonce),
+            root_pubkey_hash: nitro_result.root_pubkey_hash,
+            method: VerificationMethod::Nitro,
+        });
+    }
+
+    // No Nitro attestation - currently unsupported
+    //
+    // Future: GCP/Azure AK certificate path will be implemented here.
+    // This requires:
+    // 1. AK certificate from cloud provider (not just EK certificate)
+    // 2. Certificate chain validation to cloud provider root CA
+    // 3. AK certificate proves the signing key belongs to the cloud provider's vTPM
+    //
+    // EK certificates alone are NOT sufficient because:
+    // - EK certificate only proves "this is a genuine TPM"
+    // - It doesn't prove the AK (signing key) belongs to that TPM
+    // - Without AK binding, an attacker could use their own signing key
+
+    Err(VerifyError::NoValidAttestation(
+        "No Nitro attestation present. \
+         GCP/Azure AK certificate verification not yet implemented. \
+         Currently only AWS Nitro attestation is supported.".into()
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // NOTE: This test is disabled because the fixture uses the old attestation format
+    // (raw nonce instead of TPM2B_ATTEST from TPM2_Certify). A new fixture must be
+    // generated on a real Nitro enclave with the updated rawdogtpm2.
+    //
+    // To generate a new fixture:
+    // 1. Build AMI with updated rawdogtpm2
+    // 2. Run attestation on Nitro instance
+    // 3. Save output to test-nitro-fixture.json
+    //
+    // The new fixture should have attest_data starting with ff544347 (TPM_GENERATED_VALUE)
+    #[test]
+    #[ignore = "Fixture uses old format (raw nonce). Need new fixture with TPM2B_ATTEST."]
+    fn test_verify_nitro_fixture() {
+        let fixture = include_str!("../test-nitro-fixture.json");
+        let output: AttestationOutput = serde_json::from_str(fixture)
+            .expect("Failed to parse test-nitro-fixture.json");
+
+        let result = verify_attestation_output(&output)
+            .expect("Verification should succeed");
+
+        // Should be verified via Nitro path (no EK certs in fixture)
+        assert_eq!(result.method, VerificationMethod::Nitro);
+
+        // Nonce is now from TPM2B_ATTEST.extraData, not the raw attest_data field
+        assert!(!result.nonce.is_empty());
+
+        // Should have a root pubkey hash (AWS Nitro root)
+        assert!(!result.root_pubkey_hash.is_empty());
+        assert_eq!(result.root_pubkey_hash.len(), 64); // SHA-256 = 32 bytes = 64 hex chars
+    }
+
+    #[test]
+    fn test_reject_empty_attestation() {
+        let output = AttestationOutput {
+            ek_certificates: EkCertificates {
+                rsa_2048: None,
+                ecc_p256: None,
+                ecc_p384: None,
+            },
+            pcrs: std::collections::HashMap::new(),
+            ek_public_keys: std::collections::HashMap::new(),
+            signing_key_public_keys: std::collections::HashMap::new(),
+            attestation: AttestationContainer {
+                tpm: std::collections::HashMap::new(),
+                nitro: None,
+            },
+        };
+
+        let result = verify_attestation_output(&output);
+        assert!(matches!(result, Err(VerifyError::NoValidAttestation(_))));
+    }
 }
