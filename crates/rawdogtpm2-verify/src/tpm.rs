@@ -293,86 +293,95 @@ pub struct TpmAttestInfo {
 /// - attested.certify.name: TPM2B_NAME (certified object's name)
 /// - attested.certify.qualifiedName: TPM2B_NAME
 pub fn parse_tpm2b_attest(data: &[u8]) -> Result<TpmAttestInfo, VerifyError> {
-    if data.len() < 6 {
-        return Err(VerifyError::InvalidAttest("TPM2B_ATTEST too short".into()));
-    }
-
-    let mut offset = 0;
+    // Use a cursor to track position with overflow-safe arithmetic
+    let mut cursor = SafeCursor::new(data);
 
     // magic (4 bytes)
-    let magic = u32::from_be_bytes(data[offset..offset + 4].try_into().unwrap());
+    let magic_bytes = cursor.read_bytes(4, "magic")?;
+    let magic = u32::from_be_bytes(magic_bytes.try_into().unwrap());
     if magic != TPM_GENERATED_VALUE {
         return Err(VerifyError::InvalidAttest(format!(
             "Invalid TPM magic: expected 0x{:08x}, got 0x{:08x}",
             TPM_GENERATED_VALUE, magic
         )));
     }
-    offset += 4;
 
     // type (2 bytes)
-    let attest_type = u16::from_be_bytes(data[offset..offset + 2].try_into().unwrap());
+    let type_bytes = cursor.read_bytes(2, "type")?;
+    let attest_type = u16::from_be_bytes(type_bytes.try_into().unwrap());
     if attest_type != TPM_ST_ATTEST_CERTIFY {
         return Err(VerifyError::InvalidAttest(format!(
             "Invalid attest type: expected 0x{:04x} (CERTIFY), got 0x{:04x}",
             TPM_ST_ATTEST_CERTIFY, attest_type
         )));
     }
-    offset += 2;
 
     // qualifiedSigner (TPM2B_NAME)
-    if offset + 2 > data.len() {
-        return Err(VerifyError::InvalidAttest("Truncated qualifiedSigner".into()));
-    }
-    let signer_size = u16::from_be_bytes(data[offset..offset + 2].try_into().unwrap()) as usize;
-    offset += 2;
-    if offset + signer_size > data.len() {
-        return Err(VerifyError::InvalidAttest("Truncated qualifiedSigner data".into()));
-    }
-    let signer_name = data[offset..offset + signer_size].to_vec();
-    offset += signer_size;
+    let signer_name = cursor.read_tpm2b("qualifiedSigner")?;
 
     // extraData (TPM2B_DATA) - this is our nonce
-    if offset + 2 > data.len() {
-        return Err(VerifyError::InvalidAttest("Truncated extraData".into()));
-    }
-    let extra_size = u16::from_be_bytes(data[offset..offset + 2].try_into().unwrap()) as usize;
-    offset += 2;
-    if offset + extra_size > data.len() {
-        return Err(VerifyError::InvalidAttest("Truncated extraData data".into()));
-    }
-    let nonce = data[offset..offset + extra_size].to_vec();
-    offset += extra_size;
+    let nonce = cursor.read_tpm2b("extraData")?;
 
-    // clockInfo (TPMS_CLOCK_INFO)
-    // clock: u64, resetCount: u32, restartCount: u32, safe: u8
-    if offset + TPMS_CLOCK_INFO_SIZE > data.len() {
-        return Err(VerifyError::InvalidAttest("Truncated clockInfo".into()));
-    }
-    offset += TPMS_CLOCK_INFO_SIZE;
+    // clockInfo (TPMS_CLOCK_INFO) - skip it
+    cursor.skip(TPMS_CLOCK_INFO_SIZE, "clockInfo")?;
 
-    // firmwareVersion (8 bytes)
-    if offset + 8 > data.len() {
-        return Err(VerifyError::InvalidAttest("Truncated firmwareVersion".into()));
-    }
-    offset += 8;
+    // firmwareVersion (8 bytes) - skip it
+    cursor.skip(8, "firmwareVersion")?;
 
     // attested (TPMS_CERTIFY_INFO)
     // - name (TPM2B_NAME)
-    if offset + 2 > data.len() {
-        return Err(VerifyError::InvalidAttest("Truncated certified name".into()));
-    }
-    let name_size = u16::from_be_bytes(data[offset..offset + 2].try_into().unwrap()) as usize;
-    offset += 2;
-    if offset + name_size > data.len() {
-        return Err(VerifyError::InvalidAttest("Truncated certified name data".into()));
-    }
-    let certified_name = data[offset..offset + name_size].to_vec();
+    let certified_name = cursor.read_tpm2b("certifiedName")?;
 
     Ok(TpmAttestInfo {
         nonce,
         certified_name,
         signer_name,
     })
+}
+
+/// Safe cursor for parsing binary data with overflow protection
+struct SafeCursor<'a> {
+    data: &'a [u8],
+    offset: usize,
+}
+
+impl<'a> SafeCursor<'a> {
+    fn new(data: &'a [u8]) -> Self {
+        Self { data, offset: 0 }
+    }
+
+    /// Read exactly `len` bytes, returning error on overflow or truncation
+    fn read_bytes(&mut self, len: usize, field: &str) -> Result<&'a [u8], VerifyError> {
+        let end = self.offset.checked_add(len).ok_or_else(|| {
+            VerifyError::InvalidAttest(format!("Integer overflow reading {}", field))
+        })?;
+        if end > self.data.len() {
+            return Err(VerifyError::InvalidAttest(format!("Truncated {}", field)));
+        }
+        let bytes = &self.data[self.offset..end];
+        self.offset = end;
+        Ok(bytes)
+    }
+
+    /// Skip exactly `len` bytes
+    fn skip(&mut self, len: usize, field: &str) -> Result<(), VerifyError> {
+        let end = self.offset.checked_add(len).ok_or_else(|| {
+            VerifyError::InvalidAttest(format!("Integer overflow skipping {}", field))
+        })?;
+        if end > self.data.len() {
+            return Err(VerifyError::InvalidAttest(format!("Truncated {}", field)));
+        }
+        self.offset = end;
+        Ok(())
+    }
+
+    /// Read a TPM2B structure (2-byte size prefix + data)
+    fn read_tpm2b(&mut self, field: &str) -> Result<Vec<u8>, VerifyError> {
+        let size_bytes = self.read_bytes(2, field)?;
+        let size = u16::from_be_bytes(size_bytes.try_into().unwrap()) as usize;
+        let data = self.read_bytes(size, field)?;
+        Ok(data.to_vec())
+    }
 }
 
 
@@ -743,5 +752,73 @@ mod tests {
 
         // Policies should differ due to algorithm ID in selection structure
         assert_ne!(policy256, policy384);
+    }
+
+    // === Malicious Input Tests for parse_tpm2b_attest ===
+
+    #[test]
+    fn test_attest_empty_input() {
+        let result = parse_tpm2b_attest(&[]);
+        assert!(matches!(result, Err(VerifyError::InvalidAttest(_))));
+    }
+
+    #[test]
+    fn test_attest_truncated_magic() {
+        // Only 2 bytes when magic needs 4
+        let result = parse_tpm2b_attest(&[0xff, 0x54]);
+        assert!(matches!(result, Err(VerifyError::InvalidAttest(_))));
+    }
+
+    #[test]
+    fn test_attest_wrong_magic() {
+        // Valid length but wrong magic value
+        let mut data = vec![0x00, 0x00, 0x00, 0x00]; // Wrong magic
+        data.extend(&[0x80, 0x17]); // Correct type
+        let result = parse_tpm2b_attest(&data);
+        assert!(matches!(result, Err(VerifyError::InvalidAttest(_))));
+    }
+
+    #[test]
+    fn test_attest_huge_signer_size() {
+        // Craft input with valid magic/type but huge signer size
+        let mut data = vec![];
+        data.extend(&0xff544347u32.to_be_bytes()); // magic
+        data.extend(&0x8017u16.to_be_bytes()); // type
+        data.extend(&0xffffu16.to_be_bytes()); // signer size = 65535 (way too big)
+
+        let result = parse_tpm2b_attest(&data);
+        assert!(matches!(result, Err(VerifyError::InvalidAttest(_))),
+            "Should reject huge signer size, got: {:?}", result);
+    }
+
+    #[test]
+    fn test_attest_huge_extra_size() {
+        // Craft input with valid magic/type, small signer, but huge extra size
+        let mut data = vec![];
+        data.extend(&0xff544347u32.to_be_bytes()); // magic
+        data.extend(&0x8017u16.to_be_bytes()); // type
+        data.extend(&0x0000u16.to_be_bytes()); // signer size = 0
+        data.extend(&0xffffu16.to_be_bytes()); // extra size = 65535 (way too big)
+
+        let result = parse_tpm2b_attest(&data);
+        assert!(matches!(result, Err(VerifyError::InvalidAttest(_))),
+            "Should reject huge extra size, got: {:?}", result);
+    }
+
+    #[test]
+    fn test_attest_truncated_after_sizes() {
+        // Valid header but truncated before clockInfo
+        let mut data = vec![];
+        data.extend(&0xff544347u32.to_be_bytes()); // magic
+        data.extend(&0x8017u16.to_be_bytes()); // type
+        data.extend(&0x0002u16.to_be_bytes()); // signer size = 2
+        data.extend(&[0x00, 0x0b]); // signer (2 bytes)
+        data.extend(&0x0004u16.to_be_bytes()); // extra size = 4
+        data.extend(&[0x01, 0x02, 0x03, 0x04]); // extra (4 bytes)
+        // Missing: clockInfo, firmwareVersion, certifiedName
+
+        let result = parse_tpm2b_attest(&data);
+        assert!(matches!(result, Err(VerifyError::InvalidAttest(_))),
+            "Should reject truncated input, got: {:?}", result);
     }
 }

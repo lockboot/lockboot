@@ -128,6 +128,14 @@ impl TpmAlg {
     }
 }
 
+impl TryFrom<u16> for TpmAlg {
+    type Error = ();
+
+    fn try_from(val: u16) -> Result<Self, Self::Error> {
+        Self::from_u16(val).ok_or(())
+    }
+}
+
 /// TPM handle for the owner hierarchy
 pub const TPM_RH_OWNER: u32 = 0x40000001;
 
@@ -177,6 +185,12 @@ pub enum TpmEccCurve {
 
 /// Object attributes
 pub struct ObjectAttributes(u32);
+
+impl Default for ObjectAttributes {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl ObjectAttributes {
     pub fn new() -> Self {

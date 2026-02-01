@@ -17,13 +17,17 @@ use crate::{Tpm, EkOps, NvOps, PcrOps, NsmOps, TPM_RH_OWNER};
 use crate::{NV_INDEX_RSA_2048_EK_CERT, NV_INDEX_ECC_P256_EK_CERT, NV_INDEX_ECC_P384_EK_CERT};
 use crate::credential::compute_ecc_p256_name;
 
+/// DER SEQUENCE tag with 2-byte length (0x30 0x82)
+/// Used to detect valid X.509 certificates in DER format
+const DER_SEQUENCE_LONG: [u8; 2] = [0x30, 0x82];
+
 /// Complete attestation output containing all TPM attestation data
 #[derive(Debug, Serialize, Deserialize)]
 pub struct AttestationOutput {
     pub ek_certificates: EkCertificates,
     pub pcrs: HashMap<String, BTreeMap<u8, String>>,
-    pub ek_public_keys: HashMap<String, EkPublicKey>,
-    pub signing_key_public_keys: HashMap<String, EkPublicKey>,
+    pub ek_public_keys: HashMap<String, EccPublicKeyCoords>,
+    pub signing_key_public_keys: HashMap<String, EccPublicKeyCoords>,
     pub attestation: AttestationContainer,
 }
 
@@ -40,7 +44,7 @@ pub struct EkCertificates {
 
 /// ECC public key coordinates
 #[derive(Debug, Serialize, Deserialize)]
-pub struct EkPublicKey {
+pub struct EccPublicKeyCoords {
     pub x: String,
     pub y: String,
 }
@@ -91,10 +95,11 @@ pub fn der_to_pem(der: &[u8], label: &str) -> String {
 /// This function:
 /// 1. Retrieves EK certificates from NV RAM
 /// 2. Creates the TCG standard EK (matches certificate public key)
-/// 3. Reads all PCRs from all banks
-/// 4. Creates a signing key bound to current PCR values
-/// 5. Has the signing key sign the nonce (proves PCR state + freshness)
-/// 6. If on AWS Nitro, generates a Nitro attestation document
+/// 3. Detects platform and chooses PCR bank (SHA-384 for Nitro, SHA-256 otherwise)
+/// 4. Reads PCR values from the chosen bank
+/// 5. Computes PCR policy and creates a signing key (AK) bound to it
+/// 6. AK self-certifies via TPM2_Certify (proves AK exists with this policy)
+/// 7. If on AWS Nitro, gets Nitro attestation binding the AK public key
 ///
 /// # Arguments
 /// * `nonce` - User-provided nonce/challenge to include in attestation
@@ -113,21 +118,21 @@ pub fn attest(nonce: &[u8]) -> Result<String> {
 
     // Try to read RSA EK cert
     if let Ok(cert) = tpm.nv_read(NV_INDEX_RSA_2048_EK_CERT) {
-        if cert.starts_with(&[0x30, 0x82]) {
+        if cert.starts_with(&DER_SEQUENCE_LONG) {
             ek_certs.rsa_2048 = Some(der_to_pem(&cert, "CERTIFICATE"));
         }
     }
 
     // Try to read ECC P-256 EK cert
     if let Ok(cert) = tpm.nv_read(NV_INDEX_ECC_P256_EK_CERT) {
-        if cert.starts_with(&[0x30, 0x82]) {
+        if cert.starts_with(&DER_SEQUENCE_LONG) {
             ek_certs.ecc_p256 = Some(der_to_pem(&cert, "CERTIFICATE"));
         }
     }
 
     // Try to read ECC P-384 EK cert
     if let Ok(cert) = tpm.nv_read(NV_INDEX_ECC_P384_EK_CERT) {
-        if cert.starts_with(&[0x30, 0x82]) {
+        if cert.starts_with(&DER_SEQUENCE_LONG) {
             ek_certs.ecc_p384 = Some(der_to_pem(&cert, "CERTIFICATE"));
         }
     }
@@ -139,7 +144,7 @@ pub fn attest(nonce: &[u8]) -> Result<String> {
         .context("Failed to create standard EK - endorsement hierarchy may require authentication")?;
 
     let mut ek_public_keys = HashMap::new();
-    ek_public_keys.insert("ecc_p256".to_string(), EkPublicKey {
+    ek_public_keys.insert("ecc_p256".to_string(), EccPublicKeyCoords {
         x: hex::encode(&ek.public_key.x),
         y: hex::encode(&ek.public_key.y),
     });
@@ -181,7 +186,7 @@ pub fn attest(nonce: &[u8]) -> Result<String> {
     let signing_key = tpm.create_primary_ecc_key_with_policy(TPM_RH_OWNER, &auth_policy)?;
 
     let mut signing_key_public_keys = HashMap::new();
-    signing_key_public_keys.insert("ecc_p256".to_string(), EkPublicKey {
+    signing_key_public_keys.insert("ecc_p256".to_string(), EccPublicKeyCoords {
         x: hex::encode(&signing_key.public_key.x),
         y: hex::encode(&signing_key.public_key.y),
     });
@@ -193,7 +198,7 @@ pub fn attest(nonce: &[u8]) -> Result<String> {
         &auth_policy,
     );
 
-    // Step 6: AK self-certifies via TPM2_Certify
+    // Step 6: AK self-certifies via TPM2_Certify (produces TPM2B_ATTEST + signature)
     // This produces TPM2B_ATTEST containing the AK's name (which includes authPolicy)
     let cert_result = tpm.certify(
         signing_key.handle,  // object to certify (AK itself)
@@ -248,7 +253,7 @@ pub fn attest(nonce: &[u8]) -> Result<String> {
     tpm.flush_context(signing_key.handle)?;
     tpm.flush_context(ek.handle)?;
 
-    // Step 6: Build and output JSON
+    // Step 7: Build and output JSON
     let output = AttestationOutput {
         ek_certificates: ek_certs,
         pcrs: pcrs_by_alg,

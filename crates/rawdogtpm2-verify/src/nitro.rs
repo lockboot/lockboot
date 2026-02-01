@@ -37,7 +37,8 @@ pub struct NitroDocument {
     pub module_id: String,
     /// Timestamp (milliseconds since epoch)
     pub timestamp: u64,
-    /// PCR values (index -> hex digest)
+    /// TPM PCR values from Nitro document's `nitrotpm_pcrs` field (index -> hex SHA-384 digest)
+    /// These are the PCR values signed by AWS hardware.
     pub pcrs: BTreeMap<u8, String>,
     /// Public key (hex-encoded, if provided)
     pub public_key: Option<String>,
@@ -186,6 +187,17 @@ fn extract_cbor_integer(map: &[(CborValue, CborValue)], key: &str) -> Result<u64
             if k_text == key {
                 if let CborValue::Integer(val) = v {
                     let val_i128: i128 = (*val).into();
+                    // Validate range before casting
+                    if val_i128 < 0 {
+                        return Err(VerifyError::CborParse(format!(
+                            "Field {} has negative value: {}", key, val_i128
+                        )));
+                    }
+                    if val_i128 > u64::MAX as i128 {
+                        return Err(VerifyError::CborParse(format!(
+                            "Field {} exceeds u64 range: {}", key, val_i128
+                        )));
+                    }
                     return Ok(val_i128 as u64);
                 }
             }
@@ -618,5 +630,36 @@ mod tests {
         ];
         let result = extract_cbor_pcrs(&map);
         assert!(matches!(result, Err(VerifyError::PcrIndexOutOfBounds(_))));
+    }
+
+    // === Malicious Integer Tests ===
+
+    #[test]
+    fn test_reject_negative_timestamp() {
+        let map = vec![
+            (CborValue::Text("timestamp".to_string()), CborValue::Integer((-1i64).into())),
+        ];
+        let result = extract_cbor_integer(&map, "timestamp");
+        assert!(matches!(result, Err(VerifyError::CborParse(_))),
+            "Should reject negative timestamp, got: {:?}", result);
+    }
+
+    #[test]
+    fn test_accept_valid_timestamp() {
+        let map = vec![
+            (CborValue::Text("timestamp".to_string()), CborValue::Integer(1234567890i64.into())),
+        ];
+        let result = extract_cbor_integer(&map, "timestamp");
+        assert_eq!(result.unwrap(), 1234567890);
+    }
+
+    #[test]
+    fn test_accept_max_i64_timestamp() {
+        // i64::MAX is valid and fits in u64
+        let map = vec![
+            (CborValue::Text("timestamp".to_string()), CborValue::Integer(i64::MAX.into())),
+        ];
+        let result = extract_cbor_integer(&map, "timestamp");
+        assert_eq!(result.unwrap(), i64::MAX as u64);
     }
 }

@@ -41,8 +41,8 @@ impl Tpm {
         let _qualified_name = resp.read_tpm2b()?;
 
         Ok(ReadPublicResult {
-            public_area: public_area.to_vec(),
-            name: name.to_vec(),
+            public_area,
+            name,
         })
     }
 

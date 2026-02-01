@@ -13,8 +13,6 @@ mod nitro;
 mod tpm;
 mod x509;
 
-use std::collections::BTreeMap;
-
 use serde::Serialize;
 
 // Re-export error type
@@ -45,7 +43,7 @@ pub use pki_types::UnixTime;
 
 // Re-export types from rawdogtpm2 for convenience
 pub use rawdogtpm2::a9n::{
-    AttestationContainer, AttestationData, AttestationOutput, EkCertificates, EkPublicKey,
+    AttestationContainer, AttestationData, AttestationOutput, EccPublicKeyCoords, EkCertificates,
     NitroAttestationData,
 };
 
@@ -111,30 +109,13 @@ pub fn verify_attestation_output(
     })?;
 
     // Decode AK public key
-    let ak_x = hex::decode(&ak_pk.x)
-        .map_err(|e| VerifyError::HexDecode(e))?;
-    let ak_y = hex::decode(&ak_pk.y)
-        .map_err(|e| VerifyError::HexDecode(e))?;
+    let ak_x = hex::decode(&ak_pk.x)?;
+    let ak_y = hex::decode(&ak_pk.y)?;
 
-    // Determine PCR algorithm based on verification path and available PCRs
-    //
-    // New Nitro attestations only include the relevant PCR bank (SHA-384)
-    // because that's what the Nitro document signs and what AK is bound to.
-    //
-    // Old Nitro attestations (backwards compat) include all PCR banks but
-    // were bound to SHA-256, so we detect this by checking if multiple banks exist.
-    let (pcr_alg, pcrs_for_policy): (TpmAlg, BTreeMap<u8, String>) = if output.attestation.nitro.is_some() {
-        let has_sha384 = output.pcrs.contains_key("sha384");
-        let has_sha256 = output.pcrs.contains_key("sha256");
-
-        // New Nitro attestations only include SHA-384 (single bank = new format)
-        // Old attestations include multiple banks - use SHA-256 for backwards compat
-        if has_sha384 && !has_sha256 {
-            (TpmAlg::Sha384, output.pcrs.get("sha384").cloned().unwrap_or_default())
-        } else {
-            // Backwards compat: old fixtures have multiple banks, AK was bound to SHA-256
-            (TpmAlg::Sha256, output.pcrs.get("sha256").cloned().unwrap_or_default())
-        }
+    // Determine PCR algorithm based on verification path
+    // Nitro uses SHA-384 (signed in Nitro document), non-Nitro uses SHA-256
+    let (pcr_alg, pcrs_for_policy) = if output.attestation.nitro.is_some() {
+        (TpmAlg::Sha384, output.pcrs.get("sha384").cloned().unwrap_or_default())
     } else {
         (TpmAlg::Sha256, output.pcrs.get("sha256").cloned().unwrap_or_default())
     };
@@ -288,6 +269,15 @@ pub fn verify_attestation_output(
          GCP/Azure AK certificate verification not yet implemented. \
          Currently only AWS Nitro attestation is supported.".into()
     ))
+}
+
+/// Convenience function to verify attestation from JSON string
+///
+/// Parses JSON and calls `verify_attestation_output`.
+pub fn verify_attestation_json(json: &str) -> Result<VerificationResult, VerifyError> {
+    let output: AttestationOutput = serde_json::from_str(json)
+        .map_err(|e| VerifyError::InvalidAttest(format!("JSON parse error: {}", e)))?;
+    verify_attestation_output(&output)
 }
 
 #[cfg(test)]
