@@ -15,7 +15,7 @@ By combining these, we get a chain of trust from AWS hardware to arbitrary appli
 
 ```mermaid
 flowchart TD
-    A["<b>AWS Nitro Root CA</b><br/>Hardcoded in verification, never changes"]
+    A["<b>AWS Nitro Root CA</b><br/>Verification returns root pubkey hash"]
     B["<b>Nitro Attestation Document</b><br/>COSE Sign1 structure containing:<br/>• nitrotpm_pcrs: SHA-384 PCR values<br/>• public_key: Application key binding<br/>• nonce: Freshness proof<br/>• Certificate chain to AWS root"]
     C["<b>TPM Attestation Key (AK)</b><br/>• ECC P-256 signing key<br/>• authPolicy = PolicyPCR(SHA-384 bank)<br/>• Can only sign when PCRs match"]
     D["<b>TPM2B_ATTEST</b><br/>• extraData: nonce (matches Nitro)<br/>• certifiedName: includes authPolicy<br/>• Proves: AK bound to PCR values"]

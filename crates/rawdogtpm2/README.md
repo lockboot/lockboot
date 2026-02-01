@@ -235,10 +235,11 @@ The library uses extension traits to organize functionality:
 - **`PcrOps`** - PCR read/extend operations
 - **`NvOps`** - NV RAM read/write operations
 - **`NsmOps`** - AWS Nitro Security Module operations
+- **`EkOps`** - Endorsement Key operations (create standard EK, signing keys)
 
 Import the traits you need:
 ```rust
-use rawdogtpm2::{Tpm, PcrOps, NvOps, NsmOps};
+use rawdogtpm2::{Tpm, PcrOps, NvOps, NsmOps, EkOps};
 ```
 
 ### Hash Algorithms

@@ -14,31 +14,6 @@ This crate verifies attestation documents without requiring TPM access. It can r
 - **X.509 Chain Validation** - Certificate chain validation using rustls-webpki
 - **Zero TPM Dependencies** - Pure cryptographic verification
 
-## Verification Flow
-
-```mermaid
-flowchart TD
-    A[AttestationOutput JSON] --> B{Nitro Present?}
-    B -->|Yes| C[Verify Nitro Document]
-    B -->|No| X[Error: Unsupported]
-
-    C --> D[Verify COSE Signature]
-    D --> E[Validate Cert Chain to AWS Root]
-    E --> F[Extract signed public_key]
-
-    F --> G[Verify TPM Signature]
-    G --> H[Parse TPM2B_ATTEST]
-    H --> I[Compute PCR Policy]
-    I --> J{Name Match?}
-
-    J -->|Yes| K[Verify Nonce Binding]
-    J -->|No| Y[Error: PCR Mismatch]
-
-    K --> L{Nonces Match?}
-    L -->|Yes| M[Success: Return VerificationResult]
-    L -->|No| Z[Error: Freshness Failed]
-```
-
 ## Usage
 
 ```rust
@@ -66,7 +41,7 @@ fn verify(json: &str) -> Result<(), Box<dyn std::error::Error>> {
 | Check | Description |
 |-------|-------------|
 | COSE Signature | ECDSA P-384 signature over Nitro document |
-| Certificate Chain | Validates to hardcoded AWS Nitro Root CA |
+| Certificate Chain | Validates chain, returns root pubkey hash |
 | Public Key Binding | AK public key matches signed `public_key` field |
 | TPM Signature | AK's ECDSA P-256 signature over TPM2B_ATTEST |
 | PCR Policy | Certified name matches computed policy from SHA-384 PCRs |
@@ -88,63 +63,27 @@ pub struct VerificationResult {
 
 The `root_pubkey_hash` identifies the trust anchor. For AWS Nitro, this is the hash of the Nitro Root CA's public key.
 
-## API Reference
-
-### Main Functions
+## API
 
 ```rust
-/// Verify a complete AttestationOutput
+/// Verify a complete AttestationOutput, returns the root of trust hash
 pub fn verify_attestation_output(
     output: &AttestationOutput
 ) -> Result<VerificationResult, VerifyError>;
-
-/// Verify just the Nitro document
-pub fn verify_nitro_attestation(
-    document_hex: &str,
-    expected_nonce: Option<&str>,
-    expected_pubkey: Option<&str>,
-) -> Result<NitroVerifyResult, VerifyError>;
-
-/// Calculate PCR policy digest
-pub fn calculate_pcr_policy(
-    pcrs: &BTreeMap<u8, String>,
-    pcr_alg: TpmAlg,
-) -> Result<String, VerifyError>;
-
-/// Compute TPM object name for ECC P-256 key
-pub fn compute_ecc_p256_name(
-    x: &[u8],
-    y: &[u8],
-    auth_policy: &[u8],
-) -> Vec<u8>;
 ```
 
-### Error Types
-
-```rust
-pub enum VerifyError {
-    /// No valid attestation path available
-    NoValidAttestation(String),
-    /// Signature verification failed
-    SignatureInvalid(String),
-    /// TPM2B_ATTEST parsing or validation failed
-    InvalidAttest(String),
-    /// Certificate chain validation failed
-    CertificateInvalid(String),
-    /// Hex decoding failed
-    HexDecode(hex::FromHexError),
-}
-```
+Returns `VerificationResult` containing:
+- `nonce` - The verified challenge (hex)
+- `root_pubkey_hash` - SHA-256 of the trust anchor's public key (hex)
+- `method` - How verification was performed (currently only `Nitro`)
 
 ## Security Considerations
 
-### What This Library Trusts
+### Trust Model
 
-1. **AWS Nitro Root CA** - Hardcoded public key hash. If AWS rotates their root, this library needs updating.
+This library is **trust-agnostic**. It verifies cryptographic signatures and returns the `root_pubkey_hash` - the SHA-256 hash of the root CA's public key. **You** decide whether to trust that root.
 
-2. **Cryptographic Primitives** - Uses `p256`, `sha2`, `ecdsa` crates for cryptography.
-
-3. **Certificate Validation** - Uses `rustls-webpki` for X.509 chain validation.
+For AWS Nitro, you would check that `root_pubkey_hash` matches the known AWS Nitro Root CA public key hash.
 
 ### What You Must Verify Separately
 
@@ -154,11 +93,27 @@ pub enum VerifyError {
 
 3. **Application Logic** - The attestation proves system state at a point in time. Your application must decide if that state is acceptable.
 
-## Future Support
+### Verification Flow
 
-Currently only the Nitro path is implemented. Future versions may add:
+```mermaid
+flowchart TD
+    A[AttestationOutput JSON] --> B{Nitro Present?}
+    B -->|Yes| C[Verify Nitro Document]
+    B -->|No| X[Error: Unsupported]
 
-- **GCP Shielded VM** - AK certificate verification via Google CA
-- **Azure Trusted Launch** - AK certificate verification via Microsoft CA
+    C --> D[Verify COSE Signature]
+    D --> E[Validate Cert Chain]
+    E --> F[Extract signed public_key]
 
-These require AK certificates (not just EK certificates) to bind the signing key to the cloud provider's vTPM.
+    F --> G[Verify TPM Signature]
+    G --> H[Parse TPM2B_ATTEST]
+    H --> I[Compute PCR Policy]
+    I --> J{Name Match?}
+
+    J -->|Yes| K[Verify Nonce Binding]
+    J -->|No| Y[Error: PCR Mismatch]
+
+    K --> L{Nonces Match?}
+    L -->|Yes| M[Success: Return VerificationResult]
+    L -->|No| Z[Error: Freshness Failed]
+```
