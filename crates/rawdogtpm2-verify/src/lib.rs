@@ -171,12 +171,42 @@ pub fn verify_attestation_output(
             None, // Pubkey validation happens below
         )?;
 
-        // Verify the AK public key matches Nitro's public_key field
+        // Verify the convenience fields match what's signed in the Nitro document.
+        // These fields are duplicated in the JSON for easy access, but we must ensure
+        // they match the cryptographically signed values to prevent tampering.
+
+        // Verify public_key field matches signed document
+        let signed_pubkey = nitro_result.document.public_key.as_ref().ok_or_else(|| {
+            VerifyError::NoValidAttestation(
+                "Nitro document missing public_key field - cannot bind TPM signing key".into()
+            )
+        })?;
+        if nitro.public_key != *signed_pubkey {
+            return Err(VerifyError::SignatureInvalid(format!(
+                "attestation.nitro.public_key does not match signed value in document: {} != {}",
+                nitro.public_key, signed_pubkey
+            )));
+        }
+
+        // Verify nonce field matches signed document
+        let signed_nonce = nitro_result.document.nonce.as_ref().ok_or_else(|| {
+            VerifyError::NoValidAttestation(
+                "Nitro document missing nonce field - cannot verify freshness".into()
+            )
+        })?;
+        if nitro.nonce != *signed_nonce {
+            return Err(VerifyError::SignatureInvalid(format!(
+                "attestation.nitro.nonce does not match signed value in document: {} != {}",
+                nitro.nonce, signed_nonce
+            )));
+        }
+
+        // Verify the AK public key matches the signed public_key
         let ak_secg = format!("04{}{}", ak_pk.x, ak_pk.y);
-        if ak_secg != nitro.public_key {
+        if ak_secg != *signed_pubkey {
             return Err(VerifyError::SignatureInvalid(format!(
                 "TPM signing key does not match Nitro public_key binding: {} != {}",
-                ak_secg, nitro.public_key
+                ak_secg, signed_pubkey
             )));
         }
 
@@ -212,18 +242,7 @@ pub fn verify_attestation_output(
 mod tests {
     use super::*;
 
-    // NOTE: This test is disabled because the fixture uses the old attestation format
-    // (raw nonce instead of TPM2B_ATTEST from TPM2_Certify). A new fixture must be
-    // generated on a real Nitro enclave with the updated rawdogtpm2.
-    //
-    // To generate a new fixture:
-    // 1. Build AMI with updated rawdogtpm2
-    // 2. Run attestation on Nitro instance
-    // 3. Save output to test-nitro-fixture.json
-    //
-    // The new fixture should have attest_data starting with ff544347 (TPM_GENERATED_VALUE)
     #[test]
-    #[ignore = "Fixture uses old format (raw nonce). Need new fixture with TPM2B_ATTEST."]
     fn test_verify_nitro_fixture() {
         let fixture = include_str!("../test-nitro-fixture.json");
         let output: AttestationOutput = serde_json::from_str(fixture)
@@ -262,5 +281,45 @@ mod tests {
 
         let result = verify_attestation_output(&output);
         assert!(matches!(result, Err(VerifyError::NoValidAttestation(_))));
+    }
+
+    /// Test that tampering with the convenience public_key field is detected
+    #[test]
+    fn test_reject_tampered_nitro_public_key() {
+        let fixture = include_str!("../test-nitro-fixture.json");
+        let mut output: AttestationOutput = serde_json::from_str(fixture)
+            .expect("Failed to parse test-nitro-fixture.json");
+
+        // Tamper with the convenience field (attacker tries to substitute their own key)
+        if let Some(ref mut nitro) = output.attestation.nitro {
+            nitro.public_key = "04aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaabbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string();
+        }
+
+        let result = verify_attestation_output(&output);
+        assert!(
+            matches!(result, Err(VerifyError::SignatureInvalid(_))),
+            "Should reject tampered public_key field, got: {:?}",
+            result
+        );
+    }
+
+    /// Test that tampering with the convenience nonce field is detected
+    #[test]
+    fn test_reject_tampered_nitro_nonce() {
+        let fixture = include_str!("../test-nitro-fixture.json");
+        let mut output: AttestationOutput = serde_json::from_str(fixture)
+            .expect("Failed to parse test-nitro-fixture.json");
+
+        // Tamper with the convenience field
+        if let Some(ref mut nitro) = output.attestation.nitro {
+            nitro.nonce = "deadbeef".to_string();
+        }
+
+        let result = verify_attestation_output(&output);
+        assert!(
+            matches!(result, Err(VerifyError::SignatureInvalid(_))),
+            "Should reject tampered nonce field, got: {:?}",
+            result
+        );
     }
 }
