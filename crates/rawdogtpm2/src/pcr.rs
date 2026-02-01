@@ -48,7 +48,11 @@ pub trait PcrOps {
     fn read_all_allocated_pcrs(&mut self) -> Result<Vec<(u8, TpmAlg, Vec<u8>)>>;
 
     /// Calculate PCR policy digest for the given PCR values
-    fn calculate_pcr_policy_digest(pcr_values: &[(u8, Vec<u8>)]) -> Result<Vec<u8>>;
+    ///
+    /// # Arguments
+    /// * `pcr_values` - The PCR index and value pairs
+    /// * `pcr_alg` - The PCR bank algorithm (determines which bank is referenced in policy)
+    fn calculate_pcr_policy_digest(pcr_values: &[(u8, Vec<u8>)], pcr_alg: TpmAlg) -> Result<Vec<u8>>;
 }
 
 impl PcrOps for Tpm {
@@ -374,7 +378,10 @@ impl PcrOps for Tpm {
     }
 
     /// Calculate PCR policy digest for the given PCRs and their values
-    fn calculate_pcr_policy_digest(pcr_values: &[(u8, Vec<u8>)]) -> Result<Vec<u8>> {
+    ///
+    /// The policy digest is always SHA-256 (matches key's nameAlg), but the
+    /// pcr_alg parameter specifies which PCR bank the policy references.
+    fn calculate_pcr_policy_digest(pcr_values: &[(u8, Vec<u8>)], pcr_alg: TpmAlg) -> Result<Vec<u8>> {
         // Step 1: Calculate PCR digest (hash of selected PCR values)
         let mut pcr_hasher = Sha256::new();
         for (_index, value) in pcr_values {
@@ -404,7 +411,7 @@ impl PcrOps for Tpm {
         // count (4 bytes)
         policy_hasher.update(&1u32.to_be_bytes());
         // TPMS_PCR_SELECTION: hash (2 bytes) + sizeOfSelect (1 byte) + pcrSelect (3 bytes)
-        policy_hasher.update(&(TpmAlg::Sha256 as u16).to_be_bytes());
+        policy_hasher.update(&(pcr_alg as u16).to_be_bytes());
         policy_hasher.update(&[3u8]); // sizeOfSelect
         policy_hasher.update(&pcr_select);
 

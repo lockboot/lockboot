@@ -5,6 +5,7 @@
 //! Tests NSM functionality via TPM vendor commands
 
 use anyhow::Result;
+use hex;
 use rawdogtpm2::{Tpm, NsmOps};
 
 fn main() -> Result<()> {
@@ -27,7 +28,7 @@ fn main() -> Result<()> {
 
             println!("Attestation Document:");
             println!("  Size:         {} bytes", attestation_doc.len());
-            println!("  First 64 bytes (hex): {}", hex_encode(&attestation_doc[..64.min(attestation_doc.len())]));
+            println!("  First 64 bytes (hex): {}", hex::encode(&attestation_doc[..64.min(attestation_doc.len())]));
 
             println!("\n✓ All NSM tests passed!");
             Ok(())
@@ -38,10 +39,4 @@ fn main() -> Result<()> {
             Err(e)
         }
     }
-}
-
-fn hex_encode(bytes: &[u8]) -> String {
-    bytes.iter()
-        .map(|b| format!("{:02x}", b))
-        .collect::<String>()
 }

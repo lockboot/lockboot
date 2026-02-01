@@ -10,16 +10,25 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 
 pub mod a9n;
+pub mod credential;
+pub mod ek;
 pub mod nsm;
 pub mod nv;
 pub mod pcr;
 
 // Re-export extension traits for convenience
+pub use ek::EkOps;
 pub use nsm::NsmOps;
 pub use nv::NvOps;
 pub use pcr::PcrOps;
 
-pub use a9n::attest;
+// Re-export credential functions
+pub use credential::{
+    compute_ecc_p256_name,
+    ReadPublicResult,
+};
+
+pub use a9n::{attest, der_to_pem};
 
 /// TPM 2.0 command codes
 #[repr(u32)]
@@ -38,8 +47,13 @@ pub enum TpmCc {
     NvWrite = 0x00000137,
     NvUndefineSpace = 0x00000122,
     PolicyPCR = 0x0000017F,
+    PolicySecret = 0x00000151,
+    PolicyGetDigest = 0x00000189,
     Certify = 0x00000148,
+    ActivateCredential = 0x00000147,
+    MakeCredential = 0x00000168,
     StartAuthSession = 0x00000176,
+    ReadPublic = 0x00000173,
 }
 
 /// TPM 2.0 structure tags
@@ -65,6 +79,8 @@ pub enum TpmAlg {
     Sha256 = 0x000B,
     Sha384 = 0x000C,
     Sha512 = 0x000D,
+    Aes = 0x0006,
+    Cfb = 0x0043,
     Ecc = 0x0023,
     EcDsa = 0x0018,
     Null = 0x0010,
@@ -89,6 +105,8 @@ impl TpmAlg {
             TpmAlg::Sha256 => "sha256",
             TpmAlg::Sha384 => "sha384",
             TpmAlg::Sha512 => "sha512",
+            TpmAlg::Aes => "aes",
+            TpmAlg::Cfb => "cfb",
             TpmAlg::Ecc => "ecc",
             TpmAlg::EcDsa => "ecdsa",
             TpmAlg::Null => "null",
@@ -107,6 +125,14 @@ impl TpmAlg {
             0x0010 => Some(TpmAlg::Null),
             _ => None,
         }
+    }
+}
+
+impl TryFrom<u16> for TpmAlg {
+    type Error = ();
+
+    fn try_from(val: u16) -> Result<Self, Self::Error> {
+        Self::from_u16(val).ok_or(())
     }
 }
 
@@ -160,6 +186,12 @@ pub enum TpmEccCurve {
 /// Object attributes
 pub struct ObjectAttributes(u32);
 
+impl Default for ObjectAttributes {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ObjectAttributes {
     pub fn new() -> Self {
         Self(0)
@@ -192,6 +224,16 @@ impl ObjectAttributes {
 
     pub fn sign_encrypt(mut self) -> Self {
         self.0 |= 1 << 18;
+        self
+    }
+
+    pub fn admin_with_policy(mut self) -> Self {
+        self.0 |= 1 << 7;
+        self
+    }
+
+    pub fn restricted(mut self) -> Self {
+        self.0 |= 1 << 16;
         self
     }
 
@@ -307,6 +349,13 @@ impl CommandBuffer {
         result.extend_from_slice(&vendor_code.to_be_bytes());
         result.append(&mut self.data);
         result
+    }
+
+    /// Convert to raw bytes without finalizing as a command
+    ///
+    /// Use this when building non-command data structures like TPM2B_PUBLIC
+    fn into_vec(self) -> Vec<u8> {
+        self.data
     }
 }
 
@@ -508,272 +557,6 @@ impl Tpm {
         Ok(vendor_str_1 == NITRO_VENDOR_STRING_1 && vendor_str_2 == NITRO_VENDOR_STRING_2)
     }
 
-    /// Create a primary ECC P-256 signing key with PCR policy
-    pub fn create_primary_ecc_key_with_pcr_policy(
-        &mut self,
-        hierarchy: u32,
-        pcr_indices: &[u8],
-        bank_alg: TpmAlg,
-    ) -> Result<PrimaryKeyResult> {
-        // Read current PCR values from the specified bank
-        let pcr_values = self.pcr_read_bank(pcr_indices, bank_alg)?;
-
-        // Calculate policy digest
-        let policy_digest = Self::calculate_pcr_policy_digest(&pcr_values)?;
-
-        // Create key with this policy
-        self.create_primary_ecc_key_with_policy(hierarchy, &policy_digest)
-    }
-
-    /// Create a primary ECC P-256 signing key with a specific authPolicy
-    fn create_primary_ecc_key_with_policy(
-        &mut self,
-        hierarchy: u32,
-        auth_policy: &[u8],
-    ) -> Result<PrimaryKeyResult> {
-        // Build public area first (needed for command building)
-        let public_area = build_ecc_public_area_with_policy(auth_policy);
-
-        let command = CommandBuffer::new()
-            .write_u32(hierarchy)
-            .write_auth_empty_pw()
-            // inSensitive (TPM2B_SENSITIVE_CREATE)
-            .write_u16(4)
-            .write_u16(0) // userAuth size = 0
-            .write_u16(0) // data size = 0
-            // inPublic (TPM2B_PUBLIC) - with authPolicy
-            .write_tpm2b(&public_area)
-            // outsideInfo (TPM2B_DATA) - empty
-            .write_u16(0)
-            // creationPCR (TPML_PCR_SELECTION) - empty
-            .write_u32(0)
-            .finalize(TpmSt::Sessions, TpmCc::CreatePrimary);
-        let mut resp = self.transmit(&command)?;
-
-        // Parse response
-        let handle = resp.read_u32()?;
-        let parameter_size = resp.read_u32()?;
-
-        // Track where parameters start
-        let param_start = resp.offset();
-
-        // Read outPublic (TPM2B_PUBLIC)
-        let public_size = resp.read_u16()? as usize;
-        let public_data = resp.read_bytes(public_size)?;
-        let public_key = parse_ecc_public_key(public_data)?;
-
-        // Skip remaining CreatePrimary output parameters:
-        // - creationData (TPM2B_CREATION_DATA)
-        // - creationHash (TPM2B_DIGEST)
-        // - creationTicket (TPMT_TK_CREATION)
-        // - name (TPM2B_NAME)
-        let bytes_read = resp.offset() - param_start;
-        if bytes_read < parameter_size as usize {
-            let remaining = parameter_size as usize - bytes_read;
-            resp.read_bytes(remaining)?; // Skip remaining parameter data
-        }
-
-        // Verify we read exactly parameter_size bytes
-        let final_bytes_read = resp.offset() - param_start;
-        if final_bytes_read != parameter_size as usize {
-            bail!("Parameter size mismatch: TPM said {} bytes, we read {} bytes",
-                  parameter_size, final_bytes_read);
-        }
-
-        Ok(PrimaryKeyResult {
-            handle,
-            public_key,
-        })
-    }
-
-    /// Create a primary ECC P-256 signing key in the specified hierarchy (no policy)
-    pub fn create_primary_ecc_key(&mut self, hierarchy: u32) -> Result<PrimaryKeyResult> {
-        // Build public area first (needed for command building)
-        let public_area = build_ecc_public_area();
-
-        let command = CommandBuffer::new()
-            .write_u32(hierarchy) // Primary handle (specified hierarchy)
-            .write_auth_empty_pw()
-            // inSensitive (TPM2B_SENSITIVE_CREATE)
-            // Size will be 4 (just contains empty userAuth and data)
-            .write_u16(4)
-            .write_u16(0) // userAuth size = 0
-            .write_u16(0) // data size = 0
-            // inPublic (TPM2B_PUBLIC)
-            .write_tpm2b(&public_area)
-            // outsideInfo (TPM2B_DATA) - empty
-            .write_u16(0)
-            // creationPCR (TPML_PCR_SELECTION) - empty
-            .write_u32(0)
-            .finalize(TpmSt::Sessions, TpmCc::CreatePrimary);
-        let mut resp = self.transmit(&command)?;
-
-        // Parse response
-        // Response structure: handle, then parameterSize (when using sessions)
-        let handle = resp.read_u32()?;
-        let parameter_size = resp.read_u32()?;
-
-        // Track where parameters start
-        let param_start = resp.offset();
-
-        // Read outPublic (TPM2B_PUBLIC)
-        let public_size = resp.read_u16()? as usize;
-        let public_data = resp.read_bytes(public_size)?;
-
-        // Parse the public key from the public area
-        let public_key = parse_ecc_public_key(public_data)?;
-
-        // Skip remaining CreatePrimary output parameters:
-        // - creationData (TPM2B_CREATION_DATA)
-        // - creationHash (TPM2B_DIGEST)
-        // - creationTicket (TPMT_TK_CREATION)
-        // - name (TPM2B_NAME)
-        let bytes_read = resp.offset() - param_start;
-        if bytes_read < parameter_size as usize {
-            let remaining = parameter_size as usize - bytes_read;
-            resp.read_bytes(remaining)?; // Skip remaining parameter data
-        }
-
-        // Verify we read exactly parameter_size bytes
-        let final_bytes_read = resp.offset() - param_start;
-        if final_bytes_read != parameter_size as usize {
-            bail!("Parameter size mismatch: TPM said {} bytes, we read {} bytes",
-                  parameter_size, final_bytes_read);
-        }
-
-        Ok(PrimaryKeyResult {
-            handle,
-            public_key,
-        })
-    }
-
-    /// Sign data with a TPM key (returns DER-encoded ECDSA signature)
-    pub fn sign(&mut self, key_handle: u32, digest: &[u8]) -> Result<Vec<u8>> {
-        if digest.len() != 32 {
-            bail!("Digest must be 32 bytes for SHA-256");
-        }
-
-        let command = CommandBuffer::new()
-            .write_u32(key_handle) // Key handle
-            .write_auth_empty_pw()
-            // digest (TPM2B_DIGEST)
-            .write_tpm2b(digest)
-            // inScheme (TPMT_SIG_SCHEME) - ECDSA with SHA256
-            .write_u16(TpmAlg::EcDsa as u16)
-            .write_u16(TpmAlg::Sha256 as u16)
-            // validation (TPMT_TK_HASHCHECK) - NULL ticket
-            .write_u16(0x8024) // TPM_ST_HASHCHECK
-            .write_u32(TPM_RH_NULL)
-            .write_u16(0) // digest size = 0
-            .finalize(TpmSt::Sessions, TpmCc::Sign);
-        let mut resp = self.transmit(&command)?;
-
-        // Parse response
-        // When using sessions, response includes parameterSize before the actual data
-        let parameter_size = resp.read_u32()?;
-
-        // Track where parameters start
-        let param_start = resp.offset();
-
-        // TPMT_SIGNATURE
-        let sig_alg = resp.read_u16()?;
-        if sig_alg != TpmAlg::EcDsa as u16 {
-            bail!("Unexpected signature algorithm: 0x{:04X}", sig_alg);
-        }
-
-        let hash_alg = resp.read_u16()?;
-        if hash_alg != TpmAlg::Sha256 as u16 {
-            bail!("Unexpected hash algorithm: 0x{:04X}", hash_alg);
-        }
-
-        // TPMS_SIGNATURE_ECC
-        let r = resp.read_tpm2b()?;
-        let s = resp.read_tpm2b()?;
-
-        // Verify we read exactly parameter_size bytes
-        let bytes_read = resp.offset() - param_start;
-        if bytes_read != parameter_size as usize {
-            bail!("Parameter size mismatch in Sign: TPM said {} bytes, we read {} bytes",
-                  parameter_size, bytes_read);
-        }
-
-        // Convert to DER-encoded signature
-        Ok(encode_ecdsa_der_signature(&r, &s))
-    }
-
-    /// Certify a key using another key (e.g., certify signing key with EK)
-    /// Returns (attestation_data, signature)
-    pub fn certify(
-        &mut self,
-        object_handle: u32,  // Key to be certified
-        sign_handle: u32,     // Key to sign the certification (e.g., EK)
-        qualifying_data: &[u8], // User data included in attestation (e.g., challenge/nonce)
-    ) -> Result<CertifyResult> {
-        let command = CommandBuffer::new()
-            .write_u32(object_handle) // objectHandle (key being certified)
-            .write_u32(sign_handle) // signHandle (key doing the signing - EK)
-            // Authorization area - two sessions (one for each handle)
-            // Total auth size = 2 * 9 = 18 bytes
-            .write_u32(18)
-            // Auth for objectHandle (password session, empty password)
-            .write_u32(TPM_RS_PW)
-            .write_u16(0) // nonce
-            .write_u8(0)  // attributes
-            .write_u16(0) // password
-            // Auth for signHandle (password session, empty password)
-            .write_u32(TPM_RS_PW)
-            .write_u16(0) // nonce
-            .write_u8(0)  // attributes
-            .write_u16(0) // password
-            // qualifyingData (TPM2B_DATA) - user-provided data for attestation
-            .write_tpm2b(qualifying_data)
-            // inScheme (TPMT_SIG_SCHEME) - ECDSA with SHA256
-            .write_u16(TpmAlg::EcDsa as u16)
-            .write_u16(TpmAlg::Sha256 as u16)
-            .finalize(TpmSt::Sessions, TpmCc::Certify);
-        let mut resp = self.transmit(&command)?;
-
-        // Parse response
-
-        // Read parameterSize
-        let parameter_size = resp.read_u32()?;
-
-        // Track where parameters start
-        let param_start = resp.offset();
-
-        // certifyInfo (TPM2B_ATTEST)
-        let attest_data = resp.read_tpm2b()?;
-
-        // signature (TPMT_SIGNATURE)
-        let sig_alg = resp.read_u16()?;
-
-        if sig_alg != TpmAlg::EcDsa as u16 {
-            bail!("Unexpected signature algorithm: 0x{:04X}", sig_alg);
-        }
-
-        let hash_alg = resp.read_u16()?;
-        if hash_alg != TpmAlg::Sha256 as u16 {
-            bail!("Unexpected hash algorithm: 0x{:04X}", hash_alg);
-        }
-
-        // TPMS_SIGNATURE_ECC
-        let r = resp.read_tpm2b()?;
-        let s = resp.read_tpm2b()?;
-
-        // Verify we read exactly parameter_size bytes
-        let bytes_read = resp.offset() - param_start;
-        if bytes_read != parameter_size as usize {
-            bail!("Parameter size mismatch in Certify: TPM said {} bytes, we read {} bytes",
-                  parameter_size, bytes_read);
-        }
-
-        let signature = encode_ecdsa_der_signature(&r, &s);
-
-        Ok(CertifyResult {
-            attest_data: attest_data.to_vec(),
-            signature,
-        })
-    }
 }
 
 /// ECC public key information parsed from TPMT_PUBLIC
@@ -804,169 +587,3 @@ pub struct CertifyResult {
     pub signature: Vec<u8>,     // DER-encoded ECDSA signature
 }
 
-/// Build a TPM2B_PUBLIC structure for an ECC P-256 signing key
-fn build_ecc_public_area() -> Vec<u8> {
-    let mut buf = Vec::new();
-
-    // TPMT_PUBLIC
-    // type
-    buf.extend_from_slice(&(TpmAlg::Ecc as u16).to_be_bytes());
-
-    // nameAlg
-    buf.extend_from_slice(&(TpmAlg::Sha256 as u16).to_be_bytes());
-
-    // objectAttributes
-    let attrs = ObjectAttributes::new()
-        .fixed_tpm()
-        .fixed_parent()
-        .sensitive_data_origin()
-        .user_with_auth()
-        .decrypt()
-        .sign_encrypt();
-    buf.extend_from_slice(&attrs.value().to_be_bytes());
-
-    // authPolicy (TPM2B_DIGEST) - empty
-    buf.extend_from_slice(&0u16.to_be_bytes());
-
-    // parameters (TPMU_PUBLIC_PARMS) - for ECC it's TPMS_ECC_PARMS
-    // symmetric (TPMT_SYM_DEF_OBJECT) - NULL
-    buf.extend_from_slice(&(TpmAlg::Null as u16).to_be_bytes());
-
-    // scheme (TPMT_ECC_SCHEME) - NULL (scheme will be specified at sign time)
-    buf.extend_from_slice(&(TpmAlg::Null as u16).to_be_bytes());
-
-    // curveID
-    buf.extend_from_slice(&(TpmEccCurve::NistP256 as u16).to_be_bytes());
-
-    // kdf (TPMT_KDF_SCHEME) - NULL
-    buf.extend_from_slice(&(TpmAlg::Null as u16).to_be_bytes());
-
-    // unique (TPMU_PUBLIC_ID) - for ECC it's TPMS_ECC_POINT with empty x,y
-    buf.extend_from_slice(&0u16.to_be_bytes()); // x size = 0
-    buf.extend_from_slice(&0u16.to_be_bytes()); // y size = 0
-
-    buf
-}
-
-/// Build a TPM2B_PUBLIC structure for an ECC P-256 signing key with authPolicy
-fn build_ecc_public_area_with_policy(auth_policy: &[u8]) -> Vec<u8> {
-    let mut buf = Vec::new();
-
-    // TPMT_PUBLIC
-    // type
-    buf.extend_from_slice(&(TpmAlg::Ecc as u16).to_be_bytes());
-
-    // nameAlg
-    buf.extend_from_slice(&(TpmAlg::Sha256 as u16).to_be_bytes());
-
-    // objectAttributes
-    let attrs = ObjectAttributes::new()
-        .fixed_tpm()
-        .fixed_parent()
-        .sensitive_data_origin()
-        .user_with_auth()
-        .decrypt()
-        .sign_encrypt();
-    buf.extend_from_slice(&attrs.value().to_be_bytes());
-
-    // authPolicy (TPM2B_DIGEST) - with the actual policy
-    buf.extend_from_slice(&(auth_policy.len() as u16).to_be_bytes());
-    buf.extend_from_slice(auth_policy);
-
-    // parameters (TPMU_PUBLIC_PARMS) - for ECC it's TPMS_ECC_PARMS
-    // symmetric (TPMT_SYM_DEF_OBJECT) - NULL
-    buf.extend_from_slice(&(TpmAlg::Null as u16).to_be_bytes());
-
-    // scheme (TPMT_ECC_SCHEME) - NULL (scheme will be specified at sign time)
-    buf.extend_from_slice(&(TpmAlg::Null as u16).to_be_bytes());
-
-    // curveID
-    buf.extend_from_slice(&(TpmEccCurve::NistP256 as u16).to_be_bytes());
-
-    // kdf (TPMT_KDF_SCHEME) - NULL
-    buf.extend_from_slice(&(TpmAlg::Null as u16).to_be_bytes());
-
-    // unique (TPMU_PUBLIC_ID) - for ECC it's TPMS_ECC_POINT with empty x,y
-    buf.extend_from_slice(&0u16.to_be_bytes()); // x size = 0
-    buf.extend_from_slice(&0u16.to_be_bytes()); // y size = 0
-
-    buf
-}
-
-/// Parse ECC public key from TPMT_PUBLIC structure
-fn parse_ecc_public_key(data: &[u8]) -> Result<EccPublicKey> {
-    let mut resp = ResponseBuffer::new(data.to_vec());
-
-    // Parse TPMT_PUBLIC structure
-    let key_type = resp.read_u16()?;
-    let name_alg = resp.read_u16()?;
-    let object_attributes = resp.read_u32()?;
-    let auth_policy = resp.read_tpm2b()?;
-
-    // Parse parameters (TPMS_ECC_PARMS for ECC keys)
-    let symmetric = resp.read_u16()?;
-    let scheme = resp.read_u16()?;
-
-    // Only read scheme details if scheme is not NULL
-    if scheme != TpmAlg::Null as u16 {
-        let _scheme_detail = resp.read_u16()?;
-    }
-
-    let curve_id = resp.read_u16()?;
-    let kdf = resp.read_u16()?;
-
-    // Read unique (TPMS_ECC_POINT)
-    let x = resp.read_tpm2b()?;
-    let y = resp.read_tpm2b()?;
-
-    Ok(EccPublicKey {
-        key_type,
-        name_alg,
-        object_attributes,
-        auth_policy,
-        symmetric,
-        scheme,
-        curve_id,
-        kdf,
-        x,
-        y,
-    })
-}
-
-/// Encode ECDSA signature as DER
-fn encode_ecdsa_der_signature(r: &[u8], s: &[u8]) -> Vec<u8> {
-    fn encode_integer(value: &[u8]) -> Vec<u8> {
-        let mut result = vec![0x02]; // INTEGER tag
-
-        // Remove leading zeros
-        let trimmed: Vec<u8> = value.iter()
-            .skip_while(|&&b| b == 0)
-            .copied()
-            .collect();
-
-        let bytes = if trimmed.is_empty() {
-            vec![0x00]
-        } else if trimmed[0] & 0x80 != 0 {
-            // Add padding byte if high bit is set
-            let mut v = vec![0x00];
-            v.extend_from_slice(&trimmed);
-            v
-        } else {
-            trimmed
-        };
-
-        result.push(bytes.len() as u8);
-        result.extend_from_slice(&bytes);
-        result
-    }
-
-    let r_encoded = encode_integer(r);
-    let s_encoded = encode_integer(s);
-
-    let mut signature = vec![0x30]; // SEQUENCE tag
-    let content_len = r_encoded.len() + s_encoded.len();
-    signature.push(content_len as u8);
-    signature.extend_from_slice(&r_encoded);
-    signature.extend_from_slice(&s_encoded);
-    signature
-}

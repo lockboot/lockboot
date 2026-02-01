@@ -41,6 +41,7 @@ You can run any statically linked Linux ELF, but the minimal filesystem only has
 - **[stage1](crates/stage1/README.md)**: Secure bootloader (fetches config, verifies binaries, extends PCRs)
 - **[example-stage2](crates/example-stage2/README.md)**: Example user application
 - **[rawdogtpm2](crates/rawdogtpm2/README.md)**: Low-level TPM 2.0 operations library
+- **[rawdogtpm2-verify](crates/rawdogtpm2-verify/README.md)**: Verify attestations made by rawdogtpm2
 
 ## Cloud Deployment
 
