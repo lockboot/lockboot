@@ -144,30 +144,38 @@ pub fn attest(nonce: &[u8]) -> Result<String> {
         y: hex::encode(&ek.public_key.y),
     });
 
-    // Step 3: Read all allocated PCRs from all banks
+    // Step 3: Detect platform and choose PCR bank
+    // Nitro TPMs use SHA-384 for signed PCRs, so we bind AK to SHA-384 bank
+    // Other platforms use SHA-256
+    let is_nitro = tpm.is_nitro_tpm()?;
+    let pcr_alg = if is_nitro {
+        crate::TpmAlg::Sha384
+    } else {
+        crate::TpmAlg::Sha256
+    };
+
+    // Step 4: Read all allocated PCRs from all banks
     let all_pcrs = tpm.read_all_allocated_pcrs()?;
 
-    // Organize PCRs by algorithm (BTreeMap keeps PCRs sorted numerically)
-    let mut pcrs_by_alg: HashMap<String, BTreeMap<u8, String>> = HashMap::new();
-    for (index, alg, value) in &all_pcrs {
-        let alg_name = alg.name().to_string();
-        let pcr_map = pcrs_by_alg.entry(alg_name).or_insert_with(BTreeMap::new);
-        pcr_map.insert(*index, hex::encode(value));
-    }
-
-    // Step 4: Get SHA-256 PCR values from what we already read
-    // Use values from all_pcrs (which reads one at a time correctly)
-    let sha256_pcr_values: Vec<(u8, Vec<u8>)> = all_pcrs.iter()
-        .filter(|(_, alg, _)| *alg == crate::TpmAlg::Sha256)
+    // Get PCR values for the chosen bank
+    let pcr_values: Vec<(u8, Vec<u8>)> = all_pcrs.iter()
+        .filter(|(_, alg, _)| *alg == pcr_alg)
         .map(|(idx, _, val)| (*idx, val.clone()))
         .collect();
 
-    if sha256_pcr_values.is_empty() {
-        return Err(anyhow!("No SHA-256 PCRs allocated on this TPM"));
+    if pcr_values.is_empty() {
+        return Err(anyhow!("No {:?} PCRs allocated on this TPM", pcr_alg));
     }
 
-    // Compute policy from SHA-256 PCR values
-    let auth_policy = Tpm::calculate_pcr_policy_digest(&sha256_pcr_values)?;
+    // Only include PCRs relevant to the chain of trust in output
+    let mut pcrs_by_alg: HashMap<String, BTreeMap<u8, String>> = HashMap::new();
+    let pcr_map = pcrs_by_alg.entry(pcr_alg.name().to_string()).or_insert_with(BTreeMap::new);
+    for (idx, value) in &pcr_values {
+        pcr_map.insert(*idx, hex::encode(value));
+    }
+
+    // Step 5: Compute policy from PCR values
+    let auth_policy = Tpm::calculate_pcr_policy_digest(&pcr_values, pcr_alg)?;
 
     // Create signing key (AK) bound to this policy
     let signing_key = tpm.create_primary_ecc_key_with_policy(TPM_RH_OWNER, &auth_policy)?;
@@ -202,8 +210,8 @@ pub fn attest(nonce: &[u8]) -> Result<String> {
     let mut tpm_attestations = HashMap::new();
     tpm_attestations.insert("ecc_p256".to_string(), attestation_data);
 
-    // Check if this is a Nitro TPM and get Nitro attestation if available
-    let nitro_attestation = if tpm.is_nitro_tpm()? {
+    // Get Nitro attestation if available (we already detected Nitro earlier)
+    let nitro_attestation = if is_nitro {
         // Encode signing key public key in SECG format (0x04 || X || Y)
         let mut public_key_secg = Vec::with_capacity(1 + signing_key.public_key.x.len() + signing_key.public_key.y.len());
         public_key_secg.push(0x04); // Uncompressed point indicator

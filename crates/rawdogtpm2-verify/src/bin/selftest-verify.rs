@@ -163,11 +163,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .collect();
 
     // Calculate policy using rawdogtpm2-verify
-    let policy_hex = calculate_pcr_policy(&pcr_map)?;
+    let policy_hex = calculate_pcr_policy(&pcr_map, TpmAlg::Sha256)?;
     println!("Calculated PCR policy: {}...", &policy_hex[..32]);
 
     // Calculate policy using rawdogtpm2 (should match)
-    let policy_from_tpm = Tpm::calculate_pcr_policy_digest(&sha256_pcrs)?;
+    let policy_from_tpm = Tpm::calculate_pcr_policy_digest(&sha256_pcrs, TpmAlg::Sha256)?;
     println!("Policy from rawdogtpm2: {}...", hex::encode(&policy_from_tpm[..16]));
 
     if policy_hex == hex::encode(&policy_from_tpm) {
@@ -239,7 +239,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Create PCR-sealed key to certify
     let pcr_values: Vec<(u8, Vec<u8>)> = sha256_pcrs.clone();
-    let auth_policy = Tpm::calculate_pcr_policy_digest(&pcr_values)?;
+    let auth_policy = Tpm::calculate_pcr_policy_digest(&pcr_values, TpmAlg::Sha256)?;
     let sealed_key = tpm.create_primary_ecc_key_with_policy(TPM_RH_OWNER, &auth_policy)?;
     println!("Created PCR-sealed key: 0x{:08X}", sealed_key.handle);
 

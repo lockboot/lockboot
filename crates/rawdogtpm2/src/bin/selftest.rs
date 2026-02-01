@@ -358,8 +358,8 @@ fn standard_tests() -> Result<()> {
 
     println!("\nCreating key sealed to {} SHA-256 PCRs", pcr_values.len());
 
-    // Compute policy from the PCR values we already have
-    let auth_policy = Tpm::calculate_pcr_policy_digest(&pcr_values)?;
+    // Compute policy from the PCR values we already have (SHA-256 bank)
+    let auth_policy = Tpm::calculate_pcr_policy_digest(&pcr_values, TpmAlg::Sha256)?;
     let sealed_key = tpm.create_primary_ecc_key_with_policy(TPM_RH_OWNER, &auth_policy)?;
     println!("✓ PCR-sealed key created");
     println!("  Handle: 0x{:08X}", sealed_key.handle);

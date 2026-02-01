@@ -15,7 +15,7 @@ use crate::error::VerifyError;
 use crate::x509::{extract_public_key, parse_and_validate_cert_chain, parse_cert_chain_pem};
 
 // Import from rawdogtpm2 (single source of truth)
-use rawdogtpm2::{PcrOps, Tpm};
+use rawdogtpm2::{PcrOps, Tpm, TpmAlg};
 
 /// Result of successful TPM attestation verification
 ///
@@ -173,7 +173,8 @@ pub fn verify_tpm_signature_only(
 /// Uses the same implementation as rawdogtpm2 to ensure consistency.
 ///
 /// # Arguments
-/// * `pcrs` - Map of PCR index to hex-encoded PCR value (only SHA-256 bank)
+/// * `pcrs` - Map of PCR index to hex-encoded PCR value
+/// * `pcr_alg` - The hash algorithm of the PCR bank (determines expected PCR size)
 ///
 /// # Returns
 /// The expected policy digest as a hex-encoded string
@@ -183,12 +184,22 @@ pub fn verify_tpm_signature_only(
 /// let mut pcrs = BTreeMap::new();
 /// pcrs.insert(0, "0000...".to_string());  // 64 hex chars for SHA-256
 /// pcrs.insert(1, "0000...".to_string());
-/// let policy = calculate_pcr_policy(&pcrs)?;
+/// let policy = calculate_pcr_policy(&pcrs, TpmAlg::Sha256)?;
 /// ```
-pub fn calculate_pcr_policy(pcrs: &BTreeMap<u8, String>) -> Result<String, VerifyError> {
+pub fn calculate_pcr_policy(pcrs: &BTreeMap<u8, String>, pcr_alg: TpmAlg) -> Result<String, VerifyError> {
     if pcrs.is_empty() {
         return Err(VerifyError::InvalidAttest("No PCR values provided".into()));
     }
+
+    // Determine expected PCR size based on algorithm
+    let expected_size = match pcr_alg {
+        TpmAlg::Sha256 => 32,
+        TpmAlg::Sha384 => 48,
+        _ => return Err(VerifyError::InvalidAttest(format!(
+            "Unsupported PCR algorithm: {:?}",
+            pcr_alg
+        ))),
+    };
 
     // Validate and convert PCR values from hex strings to bytes
     // PCRs must be in sorted order (BTreeMap guarantees this)
@@ -201,18 +212,17 @@ pub fn calculate_pcr_policy(pcrs: &BTreeMap<u8, String>) -> Result<String, Verif
             )));
         }
         let value_bytes = hex::decode(value_hex)?;
-        if value_bytes.len() != 32 {
+        if value_bytes.len() != expected_size {
             return Err(VerifyError::InvalidAttest(format!(
-                "PCR {} has invalid length: expected 32 bytes, got {}",
-                idx,
-                value_bytes.len()
+                "PCR {} has invalid length for {:?}: expected {} bytes, got {}",
+                idx, pcr_alg, expected_size, value_bytes.len()
             )));
         }
         pcr_values.push((idx, value_bytes));
     }
 
     // Use rawdogtpm2's implementation (single source of truth)
-    let policy_digest = Tpm::calculate_pcr_policy_digest(&pcr_values)
+    let policy_digest = Tpm::calculate_pcr_policy_digest(&pcr_values, pcr_alg)
         .map_err(|e| VerifyError::InvalidAttest(format!("PCR policy calculation failed: {}", e)))?;
 
     Ok(hex::encode(policy_digest))
@@ -226,14 +236,16 @@ pub fn calculate_pcr_policy(pcrs: &BTreeMap<u8, String>) -> Result<String, Verif
 /// # Arguments
 /// * `expected_policy_hex` - The expected policy digest (hex string)
 /// * `pcrs` - The PCR values to verify against
+/// * `pcr_alg` - The hash algorithm of the PCR bank
 ///
 /// # Returns
 /// Ok(()) if the policy matches, error otherwise
 pub fn verify_pcr_policy(
     expected_policy_hex: &str,
     pcrs: &BTreeMap<u8, String>,
+    pcr_alg: TpmAlg,
 ) -> Result<(), VerifyError> {
-    let calculated_policy = calculate_pcr_policy(pcrs)?;
+    let calculated_policy = calculate_pcr_policy(pcrs, pcr_alg)?;
 
     if calculated_policy != expected_policy_hex {
         return Err(VerifyError::InvalidAttest(format!(
@@ -369,6 +381,7 @@ mod tests {
     use super::*;
     use ecdsa::signature::hazmat::PrehashSigner;
     use p256::ecdsa::SigningKey;
+    use rawdogtpm2::TpmAlg;
     use sha2::Sha256;
 
     /// Generate a test P-256 key pair and sign a message
@@ -575,7 +588,7 @@ mod tests {
         let pcr0 = "0".repeat(64);  // 32 bytes of zeros as hex
         pcrs.insert(0, pcr0);
 
-        let result = calculate_pcr_policy(&pcrs);
+        let result = calculate_pcr_policy(&pcrs, TpmAlg::Sha256);
         assert!(result.is_ok());
 
         let policy = result.unwrap();
@@ -591,7 +604,7 @@ mod tests {
         pcrs.insert(1, "1".repeat(64));  // All 0x11...
         pcrs.insert(2, "2".repeat(64));  // All 0x22...
 
-        let result = calculate_pcr_policy(&pcrs);
+        let result = calculate_pcr_policy(&pcrs, TpmAlg::Sha256);
         assert!(result.is_ok());
     }
 
@@ -603,7 +616,7 @@ mod tests {
         pcrs.insert(7, "7".repeat(64));
         pcrs.insert(15, "f".repeat(64));
 
-        let result = calculate_pcr_policy(&pcrs);
+        let result = calculate_pcr_policy(&pcrs, TpmAlg::Sha256);
         assert!(result.is_ok());
     }
 
@@ -613,8 +626,8 @@ mod tests {
         let mut pcrs = BTreeMap::new();
         pcrs.insert(0, "0".repeat(64));
 
-        let policy1 = calculate_pcr_policy(&pcrs).unwrap();
-        let policy2 = calculate_pcr_policy(&pcrs).unwrap();
+        let policy1 = calculate_pcr_policy(&pcrs, TpmAlg::Sha256).unwrap();
+        let policy2 = calculate_pcr_policy(&pcrs, TpmAlg::Sha256).unwrap();
 
         assert_eq!(policy1, policy2);
     }
@@ -628,8 +641,8 @@ mod tests {
         let mut pcrs2 = BTreeMap::new();
         pcrs2.insert(0, "1".repeat(64));
 
-        let policy1 = calculate_pcr_policy(&pcrs1).unwrap();
-        let policy2 = calculate_pcr_policy(&pcrs2).unwrap();
+        let policy1 = calculate_pcr_policy(&pcrs1, TpmAlg::Sha256).unwrap();
+        let policy2 = calculate_pcr_policy(&pcrs2, TpmAlg::Sha256).unwrap();
 
         assert_ne!(policy1, policy2);
     }
@@ -637,7 +650,7 @@ mod tests {
     #[test]
     fn test_calculate_pcr_policy_empty() {
         let pcrs: BTreeMap<u8, String> = BTreeMap::new();
-        let result = calculate_pcr_policy(&pcrs);
+        let result = calculate_pcr_policy(&pcrs, TpmAlg::Sha256);
         assert!(matches!(result, Err(VerifyError::InvalidAttest(_))));
     }
 
@@ -646,7 +659,7 @@ mod tests {
         let mut pcrs = BTreeMap::new();
         pcrs.insert(24, "0".repeat(64));  // Index 24 is invalid (max 23)
 
-        let result = calculate_pcr_policy(&pcrs);
+        let result = calculate_pcr_policy(&pcrs, TpmAlg::Sha256);
         assert!(matches!(result, Err(VerifyError::InvalidAttest(_))));
     }
 
@@ -655,7 +668,7 @@ mod tests {
         let mut pcrs = BTreeMap::new();
         pcrs.insert(0, "0".repeat(32));  // Only 16 bytes, need 32
 
-        let result = calculate_pcr_policy(&pcrs);
+        let result = calculate_pcr_policy(&pcrs, TpmAlg::Sha256);
         assert!(matches!(result, Err(VerifyError::InvalidAttest(_))));
     }
 
@@ -664,7 +677,7 @@ mod tests {
         let mut pcrs = BTreeMap::new();
         pcrs.insert(0, "gg".repeat(32));  // Invalid hex
 
-        let result = calculate_pcr_policy(&pcrs);
+        let result = calculate_pcr_policy(&pcrs, TpmAlg::Sha256);
         assert!(matches!(result, Err(VerifyError::HexDecode(_))));
     }
 
@@ -673,8 +686,8 @@ mod tests {
         let mut pcrs = BTreeMap::new();
         pcrs.insert(0, "0".repeat(64));
 
-        let expected = calculate_pcr_policy(&pcrs).unwrap();
-        let result = verify_pcr_policy(&expected, &pcrs);
+        let expected = calculate_pcr_policy(&pcrs, TpmAlg::Sha256).unwrap();
+        let result = verify_pcr_policy(&expected, &pcrs, TpmAlg::Sha256);
         assert!(result.is_ok());
     }
 
@@ -685,7 +698,50 @@ mod tests {
 
         // Wrong expected policy
         let wrong_expected = "f".repeat(64);
-        let result = verify_pcr_policy(&wrong_expected, &pcrs);
+        let result = verify_pcr_policy(&wrong_expected, &pcrs, TpmAlg::Sha256);
         assert!(matches!(result, Err(VerifyError::InvalidAttest(_))));
+    }
+
+    // === SHA-384 PCR Policy Tests ===
+
+    #[test]
+    fn test_calculate_pcr_policy_sha384() {
+        // Test with SHA-384 PCRs (48 bytes = 96 hex chars)
+        let mut pcrs = BTreeMap::new();
+        pcrs.insert(0, "0".repeat(96));
+
+        let result = calculate_pcr_policy(&pcrs, TpmAlg::Sha384);
+        assert!(result.is_ok());
+
+        let policy = result.unwrap();
+        // Policy is always SHA-256 (32 bytes = 64 hex chars)
+        assert_eq!(policy.len(), 64);
+    }
+
+    #[test]
+    fn test_calculate_pcr_policy_sha384_wrong_size() {
+        // SHA-384 expects 48 bytes, not 32
+        let mut pcrs = BTreeMap::new();
+        pcrs.insert(0, "0".repeat(64));  // 32 bytes - wrong for SHA-384
+
+        let result = calculate_pcr_policy(&pcrs, TpmAlg::Sha384);
+        assert!(matches!(result, Err(VerifyError::InvalidAttest(_))));
+    }
+
+    #[test]
+    fn test_calculate_pcr_policy_different_alg_different_policy() {
+        // Same PCR value but different algorithms should produce different policies
+        // because the algorithm ID is encoded in the PCR selection structure
+        let mut pcrs256 = BTreeMap::new();
+        pcrs256.insert(0, "0".repeat(64));  // 32 bytes for SHA-256
+
+        let mut pcrs384 = BTreeMap::new();
+        pcrs384.insert(0, "0".repeat(96));  // 48 bytes for SHA-384 (different zeros count)
+
+        let policy256 = calculate_pcr_policy(&pcrs256, TpmAlg::Sha256).unwrap();
+        let policy384 = calculate_pcr_policy(&pcrs384, TpmAlg::Sha384).unwrap();
+
+        // Policies should differ due to algorithm ID in selection structure
+        assert_ne!(policy256, policy384);
     }
 }

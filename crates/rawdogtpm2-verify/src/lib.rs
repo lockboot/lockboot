@@ -28,7 +28,7 @@ pub use tpm::{
 };
 
 // Re-export from rawdogtpm2 (single source of truth for TPM crypto)
-pub use rawdogtpm2::compute_ecc_p256_name;
+pub use rawdogtpm2::{compute_ecc_p256_name, TpmAlg};
 
 // Re-export Nitro types and functions
 pub use nitro::{verify_nitro_attestation, NitroDocument, NitroVerifyResult};
@@ -116,12 +116,28 @@ pub fn verify_attestation_output(
     let ak_y = hex::decode(&ak_pk.y)
         .map_err(|e| VerifyError::HexDecode(e))?;
 
-    // Get SHA-256 PCRs for policy verification (required for both paths)
-    let sha256_pcrs: BTreeMap<u8, String> = output
-        .pcrs
-        .get("sha256")
-        .cloned()
-        .unwrap_or_default();
+    // Determine PCR algorithm based on verification path and available PCRs
+    //
+    // New Nitro attestations only include the relevant PCR bank (SHA-384)
+    // because that's what the Nitro document signs and what AK is bound to.
+    //
+    // Old Nitro attestations (backwards compat) include all PCR banks but
+    // were bound to SHA-256, so we detect this by checking if multiple banks exist.
+    let (pcr_alg, pcrs_for_policy): (TpmAlg, BTreeMap<u8, String>) = if output.attestation.nitro.is_some() {
+        let has_sha384 = output.pcrs.contains_key("sha384");
+        let has_sha256 = output.pcrs.contains_key("sha256");
+
+        // New Nitro attestations only include SHA-384 (single bank = new format)
+        // Old attestations include multiple banks - use SHA-256 for backwards compat
+        if has_sha384 && !has_sha256 {
+            (TpmAlg::Sha384, output.pcrs.get("sha384").cloned().unwrap_or_default())
+        } else {
+            // Backwards compat: old fixtures have multiple banks, AK was bound to SHA-256
+            (TpmAlg::Sha256, output.pcrs.get("sha256").cloned().unwrap_or_default())
+        }
+    } else {
+        (TpmAlg::Sha256, output.pcrs.get("sha256").cloned().unwrap_or_default())
+    };
 
     // Parse TPM2B_ATTEST structure (needed for both paths)
     let attest_data = hex::decode(&attestation.attest_data)?;
@@ -146,8 +162,8 @@ pub fn verify_attestation_output(
     verify_ecdsa_p256(&attest_data, &signature, &ak_pubkey)?;
 
     // Compute authPolicy from PCRs and verify certified name (proves PCR binding)
-    if !sha256_pcrs.is_empty() {
-        let auth_policy_hex = calculate_pcr_policy(&sha256_pcrs)?;
+    if !pcrs_for_policy.is_empty() {
+        let auth_policy_hex = calculate_pcr_policy(&pcrs_for_policy, pcr_alg)?;
         let auth_policy = hex::decode(&auth_policy_hex)?;
 
         let expected_name = compute_ecc_p256_name(&ak_x, &ak_y, &auth_policy);
@@ -208,6 +224,42 @@ pub fn verify_attestation_output(
                 "TPM signing key does not match Nitro public_key binding: {} != {}",
                 ak_secg, signed_pubkey
             )));
+        }
+
+        // Verify TPM nonce matches Nitro nonce (proves attestations generated together)
+        let tpm_nonce_hex = hex::encode(&attest_info.nonce);
+        if tpm_nonce_hex != *signed_nonce {
+            return Err(VerifyError::SignatureInvalid(format!(
+                "TPM nonce does not match Nitro nonce - attestations not generated together: {} != {}",
+                tpm_nonce_hex, signed_nonce
+            )));
+        }
+
+        // Verify SHA-384 PCRs match signed values in Nitro document
+        // The Nitro document contains nitrotpm_pcrs which are signed by AWS hardware
+        if let Some(sha384_pcrs) = output.pcrs.get("sha384") {
+            let signed_pcrs = &nitro_result.document.pcrs;
+
+            // Check all signed PCRs are present and match
+            for (idx, signed_value) in signed_pcrs.iter() {
+                match sha384_pcrs.get(idx) {
+                    Some(claimed_value) if claimed_value == signed_value => {
+                        // Match - good
+                    }
+                    Some(claimed_value) => {
+                        return Err(VerifyError::SignatureInvalid(format!(
+                            "PCR {} SHA-384 value does not match signed value: {} != {}",
+                            idx, claimed_value, signed_value
+                        )));
+                    }
+                    None => {
+                        return Err(VerifyError::SignatureInvalid(format!(
+                            "PCR {} missing from output.pcrs[sha384] but present in signed Nitro document",
+                            idx
+                        )));
+                    }
+                }
+            }
         }
 
         // Nonce is from TPM2B_ATTEST.extraData
@@ -319,6 +371,30 @@ mod tests {
         assert!(
             matches!(result, Err(VerifyError::SignatureInvalid(_))),
             "Should reject tampered nonce field, got: {:?}",
+            result
+        );
+    }
+
+    /// Test that tampering with SHA-384 PCR values is detected
+    #[test]
+    fn test_reject_tampered_pcr_values() {
+        let fixture = include_str!("../test-nitro-fixture.json");
+        let mut output: AttestationOutput = serde_json::from_str(fixture)
+            .expect("Failed to parse test-nitro-fixture.json");
+
+        // Tamper with a SHA-384 PCR value
+        if let Some(sha384_pcrs) = output.pcrs.get_mut("sha384") {
+            sha384_pcrs.insert(
+                0,
+                "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef".to_string()
+            );
+        }
+
+        let result = verify_attestation_output(&output);
+        // Tampering is detected at policy verification: AK's authPolicy doesn't match PCR values
+        assert!(
+            matches!(result, Err(VerifyError::InvalidAttest(_))),
+            "Should reject tampered PCR values, got: {:?}",
             result
         );
     }
