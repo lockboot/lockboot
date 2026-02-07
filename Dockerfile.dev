@@ -13,7 +13,8 @@ RUN DEBIAN_FRONTEND=noninteractive apt-get -qq update && \
     iptables \
     iproute2 \
     dnsmasq \
-    swtpm swtpm-tools
+    swtpm swtpm-tools \
+    tpm2-tools
 
 # Install Claude Code
 #RUN curl -fsSL https://claude.ai/install.sh | bash

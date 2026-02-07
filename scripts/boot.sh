@@ -79,12 +79,17 @@ cp "${OVMF_VARS_ORIG}" "${OVMF_VARS}"
 # Setup TPM state directory
 mkdir -p $TMP/tpm-state
 
-# Start software TPM
+# Provision NV indices for GCP-style attestation (idempotent)
+# This starts its own swtpm instance with tpm2-tools-compatible sockets, then shuts it down
+${SCRIPT_DIR}/provision-test-tpm.sh $TMP/tpm-state
+
+# Start swtpm for QEMU (original way - just ctrl socket)
 swtpm socket --tpmstate dir=$TMP/tpm-state \
     --ctrl type=unixio,path=$TMP/swtpm-sock \
     --tpm2 \
     --pid file=$TMP/swtpm.pid \
     --daemon
+sleep 1
 
 # Cleanup function
 cleanup() {
