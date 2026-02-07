@@ -36,7 +36,7 @@ define ARTIFACT_RULE
 	@cp downloads/$$@ $$@
 endef
 
-$(foreach artifact,busybox bubblewrap stub.efi kernel.rpm,$(eval $(call ARTIFACT_RULE,$(artifact))))
+$(foreach artifact,busybox stub.efi kernel.rpm,$(eval $(call ARTIFACT_RULE,$(artifact))))
 
 downloads/%:
 	$(MAKE) -C downloads $*
@@ -72,7 +72,7 @@ docker-buildx-setup:
 	docker buildx inspect --bootstrap
 
 # Build runtime image for current platform only and load into Docker
-docker-runtime: x86_64/busybox x86_64/bubblewrap x86_64/stage1 aarch64/busybox aarch64/bubblewrap aarch64/stage1
+docker-runtime: x86_64/busybox x86_64/stage1 aarch64/busybox aarch64/stage1
 	docker buildx build \
 		-f Dockerfile.runtime \
 		-t $(RUNTIME_IMAGE) \
@@ -80,7 +80,7 @@ docker-runtime: x86_64/busybox x86_64/bubblewrap x86_64/stage1 aarch64/busybox a
 		.
 
 # Build multi-arch and export to OCI tar (for local multi-arch without registry)
-docker-runtime-oci: x86_64/busybox x86_64/bubblewrap x86_64/stage1 aarch64/busybox aarch64/bubblewrap aarch64/stage1
+docker-runtime-oci: x86_64/busybox x86_64/stage1 aarch64/busybox aarch64/stage1
 	docker buildx build \
 		--platform linux/amd64,linux/arm64 \
 		-f Dockerfile.runtime \
@@ -129,7 +129,7 @@ docker-shell-dev: docker-build-dev
 
 # Build the UKI and boot disk for a specific architecture
 # This creates: UKI, disk image with EFI boot structure
-%/boot.disk: %/busybox %/bubblewrap %/stage1 %/stub.efi %/kernel.rpm keys/db.crt
+%/boot.disk: %/busybox %/stage1 %/stub.efi %/kernel.rpm keys/db.crt
 	$(DOCKER_RUN) $(DOCKER_OPT_DOCKER) -e ARCH=$* \
 		$(BUILD_IMAGE) ./scripts/build.sh
 

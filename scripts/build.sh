@@ -19,7 +19,7 @@ mkdir -p "${OUTPUT_DIR}/tmp"
 # Determine the correct systemd-efistub filename, PE format, and objcopy command based on architecture
 if [ "${ARCH}" = "x86_64" ]; then
     PE_FORMAT="pei-x86-64"
-    OBJCOPY="objcopy"
+    OBJCOPY="x86_64-linux-gnu-objcopy"
 elif [ "${ARCH}" = "aarch64" ]; then
     PE_FORMAT="pei-aarch64-little"
     OBJCOPY="aarch64-linux-gnu-objcopy"
@@ -79,10 +79,6 @@ mkdir -p "${INITRAMFS_DIR}"/{bin,sbin,etc,proc,sys,dev,lib,lib64,tmp}
 # Copy busybox and create symlinks
 echo "Installing busybox..."
 cp "${ARCH}/busybox" "${INITRAMFS_DIR}/bin/"
-
-# Copy bubblewrap
-echo "Installing bubblewrap..."
-cp "${ARCH}/bubblewrap" "${INITRAMFS_DIR}/bin/bwrap"
 
 # Copy stage1 binary
 echo "Installing stage1..."

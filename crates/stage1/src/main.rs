@@ -2,13 +2,13 @@
 
 use anyhow::{anyhow, Context, Result};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
-use rawdogtpm2::{Tpm, PcrOps};
+use vaportpm_attest::{Tpm, PcrOps};
 use reqwest::blocking::Client;
 use rustls::crypto::CryptoProvider;
 use serde::{Deserialize, Serialize};
 use serde::de::Error as _;
 use sha2::{Digest, Sha256};
-use rawdogtpm2 as tpm;
+use vaportpm_attest as tpm;
 use std::fs;
 use std::io::{self, Write};
 use std::os::unix::fs::PermissionsExt;
