@@ -1,24 +1,16 @@
-.PHONY: all help clean
+.PHONY: all help clean check-urls
 
 # Alpine Linux version (stable)
 ALPINE_VERSION := v3.22
 ALPINE_BASE_URL := https://dl-cdn.alpinelinux.org/alpine/$(ALPINE_VERSION)/main
 
 # Busybox (static) from Alpine Linux
-BUSYBOX_VERSION := 1.37.0-r19
-BUSYBOX_SHA256_x86_64 := e16ee4ee5c8a25b6090986ec6aa36e06cb58d4432d253ad9cef1e22110092cd4
-BUSYBOX_SHA256_aarch64 := 44895a11196e6a5260e27be827522bb5f3fa3f81aa35171a780be4be0780bdb1
+BUSYBOX_VERSION := 1.37.0-r20
+BUSYBOX_SHA256_x86_64 := 488ad6efd04b5a722719e79f8e0dcc2c24afd6758867af3ce41b04839e60c74b
+BUSYBOX_SHA256_aarch64 := ee469aee2958feffd7f64dd96655704025ff60af614f77a1d7323dc237c34da2
 BUSYBOX_APK := busybox-static-$(BUSYBOX_VERSION).apk
 BUSYBOX_URL_x86_64 := $(ALPINE_BASE_URL)/x86_64/$(BUSYBOX_APK)
 BUSYBOX_URL_aarch64 := $(ALPINE_BASE_URL)/aarch64/$(BUSYBOX_APK)
-
-# Bubblewrap from Alpine Linux
-BUBBLEWRAP_VERSION := 0.11.0-r1
-BUBBLEWRAP_SHA256_x86_64 := 2f3307838e3a242d4e5c173210ef2b70becd0cc57f0a56d5fe17ebf0fda2dc8d
-BUBBLEWRAP_SHA256_aarch64 := 8041baaf15221574d2d14fa78989ce536dd928ca297ee7555cd621b48f837e58
-BUBBLEWRAP_APK := bubblewrap-static-$(BUBBLEWRAP_VERSION).apk
-BUBBLEWRAP_URL_x86_64 := $(ALPINE_BASE_URL)/x86_64/$(BUBBLEWRAP_APK)
-BUBBLEWRAP_URL_aarch64 := $(ALPINE_BASE_URL)/aarch64/$(BUBBLEWRAP_APK)
 
 # systemd-boot-unsigned from Amazon Linux (provides EFI stub)
 # x86_64 provides: /usr/lib/systemd/boot/efi/linuxx64.efi.stub
@@ -47,7 +39,7 @@ AEMM_URL := https://github.com/aws/amazon-ec2-metadata-mock/releases/download/$(
 AEMM_SHA256 := 4f89ddc71ac53ce540bda1f9c340526d558eed8e41349761f2798acf1b254950
 
 ARCHS = x86_64 aarch64
-TARGETS = busybox bubblewrap stub.efi kernel.rpm
+TARGETS = busybox stub.efi kernel.rpm
 
 all: $(ARCHS) ec2-metadata-mock-linux-amd64
 
@@ -60,14 +52,6 @@ aarch64: $(addprefix aarch64/,$(TARGETS))
 %/busybox: %/$(BUSYBOX_APK)
 	@mkdir -p $*
 	@tar --warning=no-unknown-keyword -xzOf $< bin/busybox.static > "$@"
-	@chmod +x "$@"
-
-%/$(BUBBLEWRAP_APK):
-	@./download-and-verify.sh "$@" "$(BUBBLEWRAP_SHA256_$*)" "$(BUBBLEWRAP_URL_$*)"
-
-%/bubblewrap: %/$(BUBBLEWRAP_APK)
-	@mkdir -p $*
-	@tar --warning=no-unknown-keyword -xzOf $< usr/bin/bwrap.static > "$@"
 	@chmod +x "$@"
 
 # Download systemd-boot-unsigned RPM from Amazon Linux
@@ -112,3 +96,14 @@ kernel-hash-%:
 
 clean:
 	rm -rf x86_64 aarch64 ec2-metadata-mock-linux-amd64
+
+# Check all download URLs are still valid
+check-urls:
+	@echo "Checking URLs..."
+	@curl -sfI "$(BUSYBOX_URL_x86_64)" > /dev/null && echo "OK: busybox x86_64" || echo "FAIL: busybox x86_64"
+	@curl -sfI "$(BUSYBOX_URL_aarch64)" > /dev/null && echo "OK: busybox aarch64" || echo "FAIL: busybox aarch64"
+	@curl -sfI "$(SYSTEMD_BOOT_URL_x86_64)" > /dev/null && echo "OK: systemd-boot x86_64" || echo "FAIL: systemd-boot x86_64"
+	@curl -sfI "$(SYSTEMD_BOOT_URL_aarch64)" > /dev/null && echo "OK: systemd-boot aarch64" || echo "FAIL: systemd-boot aarch64"
+	@curl -sfI "$(AMAZON_KERNEL_URL_x86_64)" > /dev/null && echo "OK: kernel x86_64" || echo "FAIL: kernel x86_64"
+	@curl -sfI "$(AMAZON_KERNEL_URL_aarch64)" > /dev/null && echo "OK: kernel aarch64" || echo "FAIL: kernel aarch64"
+	@curl -sfI "$(AEMM_URL)" > /dev/null && echo "OK: ec2-metadata-mock" || echo "FAIL: ec2-metadata-mock"

@@ -8,6 +8,5 @@ README.md
 stage1
 busybox
 ec2-metadata-mock-*
-bubblewrap
 secure-boot-keys
 old

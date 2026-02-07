@@ -5,32 +5,28 @@ RUN rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
 
 # Install tools needed for UKI building
 RUN apt-get -qq update && \
-    apt-get install -y \
-    binutils \
+    apt-get install -y --no-install-recommends \
     binutils-aarch64-linux-gnu \
     binutils-x86-64-linux-gnu \
-    gcc \
-    gcc-aarch64-linux-gnu \
-    qemu-efi-aarch64 \
-    kmod \
     cpio \
-    gzip \
-    findutils \
+    curl \
     dosfstools \
+    efitools \
     fdisk \
+    findutils \
     gdisk \
-    util-linux \
+    gzip \
+    kmod \
+    make \
+    ovmf \
     python3 \
     python3-pip \
+    qemu-efi-aarch64 \
     rpm2cpio \
     sbsigntool \
-    efitools \
+    util-linux \
     uuid-runtime \
-    musl-tools \
-    ovmf \
-    wget \
-    curl \
-    make && \
+    wget && \
     pip3 install --break-system-packages virt-firmware
 
 # Reproducible builds environment
