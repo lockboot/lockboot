@@ -4,6 +4,9 @@ set -euox pipefail
 # Get the absolute path of the script directory
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# Repository root (computed from script location: tools/qemu-test -> ../..)
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+
 if [ "$YES_INSIDE_DOCKER_DO_DANGEROUS_IPTABLES" != 1 ]; then
     echo "Error: not inside docker, refusing to do dangerous stuff!!"
     exit 1
@@ -13,14 +16,14 @@ fi
 ARCH=${ARCH:-x86_64}
 
 # Default user-data file
-KEYDIR=keys
-USER_DATA="user-data.json"
+KEYDIR="${REPO_ROOT}/tools/build-uki/keys"
+USER_DATA="${REPO_ROOT}/user-data.json"
 TMP=/tmp
 
 echo "=== Booting UKI with Secure Boot + TPM 2.0 (${ARCH}) ==="
 echo "User-data file: ${USER_DATA}"
 
-AMMM=${SCRIPT_DIR}/../downloads/ec2-metadata-mock-linux-amd64
+AMMM=${SCRIPT_DIR}/ec2-metadata-mock-linux-amd64
 
 # Check dependencies
 if [ ! -f ${AMMM} ]; then
@@ -28,13 +31,15 @@ if [ ! -f ${AMMM} ]; then
     exit 1
 fi
 
-if [ ! -f "${ARCH}/boot.disk" ]; then
-    echo "Error: ${ARCH}/boot.disk not found. Run 'make ${ARCH}' first."
+if [ ! -f "${USER_DATA}" ]; then
+    echo "Error: User-data file '${USER_DATA}' not found."
     exit 1
 fi
 
-if [ ! -f "${USER_DATA}" ]; then
-    echo "Error: User-data file '${USER_DATA}' not found."
+# Boot disk location (in tools/build-uki)
+BOOT_DISK="${REPO_ROOT}/tools/build-uki/${ARCH}/boot.disk"
+if [ ! -f "${BOOT_DISK}" ]; then
+    echo "Error: ${BOOT_DISK} not found. Run 'make ${ARCH}' first."
     exit 1
 fi
 
@@ -66,7 +71,7 @@ else
     exit 1
 fi
 
-OVMF_VARS_ORIG="${ARCH}/efi-vars.ovmf"
+OVMF_VARS_ORIG="${REPO_ROOT}/tools/build-uki/${ARCH}/efi-vars.ovmf"
 OVMF_VARS="/tmp/efi-vars.ovmf"
 
 if [ ! -f "${OVMF_CODE}" ]; then
@@ -79,12 +84,17 @@ cp "${OVMF_VARS_ORIG}" "${OVMF_VARS}"
 # Setup TPM state directory
 mkdir -p $TMP/tpm-state
 
-# Start software TPM
+# Provision NV indices for GCP-style attestation (idempotent)
+# This starts its own swtpm instance with tpm2-tools-compatible sockets, then shuts it down
+${SCRIPT_DIR}/provision-test-tpm.sh $TMP/tpm-state
+
+# Start swtpm for QEMU (original way - just ctrl socket)
 swtpm socket --tpmstate dir=$TMP/tpm-state \
     --ctrl type=unixio,path=$TMP/swtpm-sock \
     --tpm2 \
     --pid file=$TMP/swtpm.pid \
     --daemon
+sleep 1
 
 # Cleanup function
 cleanup() {
@@ -175,7 +185,7 @@ ${QEMU_CMD} \
     -chardev socket,id=chrtpm,path=$TMP/swtpm-sock \
     -tpmdev emulator,id=tpm0,chardev=chrtpm \
     -device ${TPM_DEVICE},tpmdev=tpm0 \
-    -drive file=${ARCH}/boot.disk,format=raw,if=none,id=boot \
+    -drive file=${BOOT_DISK},format=raw,if=none,id=boot \
     -device nvme,serial=boot,drive=boot,bootindex=0 \
     -netdev tap,id=net0,ifname=tap0,script=no \
     -device virtio-net-pci,netdev=net0 \

@@ -30,8 +30,6 @@ else
     EC2_ARCH="${ARCH}"
 fi
 
-WORK_DIR="${ARCH}"
-
 # Download and verify from GitHub release or use local files
 if [ "${VERSION}" != "local" ]; then
     echo "=== Downloading release ${VERSION} from GitHub ==="
@@ -70,6 +68,10 @@ if [ "${VERSION}" != "local" ]; then
     echo "Using verified release files from ${VERSION}"
 else
     echo "=== Using local build files ==="
+    # Get script directory and compute repo root
+    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
+    WORK_DIR="${REPO_ROOT}/tools/build-uki/${ARCH}"
 fi
 
 IMAGE_FILE="${WORK_DIR}/boot.disk"
