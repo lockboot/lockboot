@@ -4,16 +4,16 @@ set -euo pipefail
 # Get the absolute path of the script directory
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# Setup secure boot keys
-KEYDIR=keys
+# Setup secure boot keys (relative to script directory)
+KEYDIR="${SCRIPT_DIR}/keys"
 
 # Get architecture from environment (default to x86_64)
 ARCH=${ARCH:-x86_64}
 
 echo "=== Building UKI for Amazon Linux 2023 (${ARCH}) ==="
 
-# Create architecture-specific output directory
-OUTPUT_DIR="${ARCH}"
+# Output directory (same as dependencies - everything self-contained)
+OUTPUT_DIR="${SCRIPT_DIR}/${ARCH}"
 mkdir -p "${OUTPUT_DIR}/tmp"
 
 # Determine the correct systemd-efistub filename, PE format, and objcopy command based on architecture
@@ -29,14 +29,14 @@ else
 fi
 
 # Use systemd-boot stub extracted by Makefile from Amazon Linux RPM
-if [ ! -f "${ARCH}/stub.efi" ]; then
-    echo "ERROR: systemd-boot stub not found at ${ARCH}/stub.efi"
-    echo "Please run 'make ${ARCH}/stub.efi' first"
+if [ ! -f "${OUTPUT_DIR}/stub.efi" ]; then
+    echo "ERROR: systemd-boot stub not found at ${OUTPUT_DIR}/stub.efi"
+    echo "Please run 'make tools/build-uki/${ARCH}/stub.efi' first"
     exit 1
 fi
 
 echo "Extracting kernel RPM..."
-rpm2cpio "downloads/${ARCH}"/kernel6.12-*.rpm | (cd "${OUTPUT_DIR}/tmp" && cpio --quiet -idmu)
+rpm2cpio "${OUTPUT_DIR}"/kernel6.12-*.rpm | (cd "${OUTPUT_DIR}/tmp" && cpio --quiet -idmu)
 if [ ! -d "${OUTPUT_DIR}/tmp/lib/modules" ]; then
     echo "ERROR: kernel modules not found after extraction!"
     exit 1
@@ -78,11 +78,11 @@ mkdir -p "${INITRAMFS_DIR}"/{bin,sbin,etc,proc,sys,dev,lib,lib64,tmp}
 
 # Copy busybox and create symlinks
 echo "Installing busybox..."
-cp "${ARCH}/busybox" "${INITRAMFS_DIR}/bin/"
+cp "${OUTPUT_DIR}/busybox" "${INITRAMFS_DIR}/bin/"
 
 # Copy stage1 binary
 echo "Installing stage1..."
-cp "${ARCH}/stage1" "${INITRAMFS_DIR}/bin/stage1"
+cp "${OUTPUT_DIR}/stage1" "${INITRAMFS_DIR}/bin/stage1"
 chmod +x "${INITRAMFS_DIR}/bin/stage1"
 
 # Copy required kernel modules

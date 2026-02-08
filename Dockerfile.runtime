@@ -5,8 +5,8 @@ ARG TARGETARCH
 
 # Map Docker's TARGETARCH to our directory structure
 # Create symlinks to map amd64->x86_64 and arm64->aarch64
-COPY x86_64/ /binaries/x86_64/
-COPY aarch64/ /binaries/aarch64/
+COPY tools/build-uki/x86_64/ /binaries/x86_64/
+COPY tools/build-uki/aarch64/ /binaries/aarch64/
 
 # Create arch-specific directory based on TARGETARCH
 RUN mkdir -p /target && \

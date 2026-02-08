@@ -1,12 +1,12 @@
-.PRECIOUS: keys/% downloads/%
+.PRECIOUS: tools/build-uki/keys/% tools/build-uki/%
 
 all: build
 
 ARCHS=x86_64 aarch64
 build: $(ARCHS)
 
-amd64 x86_64: x86_64/boot.disk
-arm64 aarch64: aarch64/boot.disk
+amd64 x86_64: tools/build-uki/x86_64/boot.disk
+arm64 aarch64: tools/build-uki/aarch64/boot.disk
 
 DEFAULT_STAGE2_URL = https://lockboot.s3.us-east-1.amazonaws.com/examples/stage2/user-data.json
 user-data.json:
@@ -17,29 +17,30 @@ BUILD_IMAGE = lockboot:build
 DEV_IMAGE = lockboot:dev
 RUNTIME_IMAGE ?= lockboot:latest
 
-keys/%:
-	$(MAKE) -C keys
+tools/build-uki/keys/%:
+	$(MAKE) -C tools/build-uki/keys
 
 clean:
-	rm -rf $(ARCHS)
+	rm -rf tools/build-uki/x86_64/boot.disk tools/build-uki/x86_64/stage1 tools/build-uki/x86_64/tmp tools/build-uki/x86_64/*.img tools/build-uki/x86_64/*.efi tools/build-uki/x86_64/config-* tools/build-uki/x86_64/efi-vars.ovmf
+	rm -rf tools/build-uki/aarch64/boot.disk tools/build-uki/aarch64/stage1 tools/build-uki/aarch64/tmp tools/build-uki/aarch64/*.img tools/build-uki/aarch64/*.efi tools/build-uki/aarch64/config-* tools/build-uki/aarch64/efi-vars.ovmf
 
 distclean: clean
-	$(MAKE) -C downloads clean
-	$(MAKE) -C keys clean
+	$(MAKE) -C tools/build-uki clean
+	$(MAKE) -C tools/build-uki/keys clean
+	$(MAKE) -C tools/qemu-test clean
 
-# Generate separate rules for each artifact to avoid grouped target behavior
-define ARTIFACT_RULE
-.PRECIOUS: %/$(1)
-%/$(1)::
-	@mkdir -p $$*
-	@make -C downloads $$@
-	@cp downloads/$$@ $$@
-endef
+# Download dependencies via tools/build-uki Makefile
+tools/build-uki/%/busybox:
+	$(MAKE) -C tools/build-uki $*/busybox
 
-$(foreach artifact,busybox stub.efi kernel.rpm,$(eval $(call ARTIFACT_RULE,$(artifact))))
+tools/build-uki/%/stub.efi:
+	$(MAKE) -C tools/build-uki $*/stub.efi
 
-downloads/%:
-	$(MAKE) -C downloads $*
+tools/build-uki/%/kernel.rpm:
+	$(MAKE) -C tools/build-uki $*/kernel.rpm
+
+tools/qemu-test/%:
+	$(MAKE) -C tools/qemu-test $*
 
 
 #####################################################################
@@ -72,7 +73,7 @@ docker-buildx-setup:
 	docker buildx inspect --bootstrap
 
 # Build runtime image for current platform only and load into Docker
-docker-runtime: x86_64/busybox x86_64/stage1 aarch64/busybox aarch64/stage1
+docker-runtime: tools/build-uki/x86_64/busybox tools/build-uki/x86_64/stage1 tools/build-uki/aarch64/busybox tools/build-uki/aarch64/stage1
 	docker buildx build \
 		-f Dockerfile.runtime \
 		-t $(RUNTIME_IMAGE) \
@@ -80,7 +81,7 @@ docker-runtime: x86_64/busybox x86_64/stage1 aarch64/busybox aarch64/stage1
 		.
 
 # Build multi-arch and export to OCI tar (for local multi-arch without registry)
-docker-runtime-oci: x86_64/busybox x86_64/stage1 aarch64/busybox aarch64/stage1
+docker-runtime-oci: tools/build-uki/x86_64/busybox tools/build-uki/x86_64/stage1 tools/build-uki/aarch64/busybox tools/build-uki/aarch64/stage1
 	docker buildx build \
 		--platform linux/amd64,linux/arm64 \
 		-f Dockerfile.runtime \
@@ -129,17 +130,17 @@ docker-shell-dev: docker-build-dev
 
 # Build the UKI and boot disk for a specific architecture
 # This creates: UKI, disk image with EFI boot structure
-%/boot.disk: %/busybox %/stage1 %/stub.efi %/kernel.rpm keys/db.crt
+tools/build-uki/%/boot.disk: tools/build-uki/%/busybox tools/build-uki/%/stage1 tools/build-uki/%/stub.efi tools/build-uki/%/kernel.rpm tools/build-uki/keys/db.crt
 	$(DOCKER_RUN) $(DOCKER_OPT_DOCKER) -e ARCH=$* \
-		$(BUILD_IMAGE) ./scripts/build.sh
+		$(BUILD_IMAGE) ./tools/build-uki/build.sh
 
-boot-%: downloads/ec2-metadata-mock-linux-amd64 %/boot.disk user-data.json
+boot-%: tools/qemu-test/ec2-metadata-mock-linux-amd64 tools/build-uki/%/boot.disk user-data.json
 	$(DOCKER_RUN) -e ARCH=$* $(DOCKER_OPT_KVM) \
 		-e YES_INSIDE_DOCKER_DO_DANGEROUS_IPTABLES=1 --cap-add=NET_ADMIN --device=/dev/net/tun \
-		$(DEV_IMAGE) ./scripts/boot.sh
+		$(DEV_IMAGE) ./tools/qemu-test/boot.sh
 
-%/stage1: docker-build-base
-	mkdir -p $*
+tools/build-uki/%/stage1: docker-build-base
+	mkdir -p tools/build-uki/$*
 	$(DOCKER_RUN) -e ARCH=$* $(DOCKER_SAMEUSER) $(BUILD_IMAGE) \
 		bash -c "rustup target add $*-unknown-linux-musl && cargo build --release --locked --all --target $*-unknown-linux-musl"
 	cp target/$*-unknown-linux-musl/release/stage1 $@

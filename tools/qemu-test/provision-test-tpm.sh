@@ -79,14 +79,10 @@ openssl x509 -in ak.crt -outform DER -out ak.crt.der
 tpm2_nvdefine $NV_ECC_CERT -s $(stat -c%s ak.crt.der) -a "ownerread|ownerwrite|authread|authwrite"
 tpm2_nvwrite $NV_ECC_CERT -i ak.crt.der
 
-# 8. Write dummy RSA template (for detection)
-tpm2_nvdefine $NV_RSA_TEMPLATE -s 32 -a "ownerread|ownerwrite|authread|authwrite"
-dd if=/dev/zero bs=32 count=1 2>/dev/null | tpm2_nvwrite $NV_RSA_TEMPLATE -i -
-
-# 9. Cleanup TPM transient objects
+# 8. Cleanup TPM transient objects
 tpm2_flushcontext -t
 
-# 10. Clean shutdown to save state (boot.sh will restart swtpm)
+# 9. Clean shutdown to save state (boot.sh will restart swtpm)
 tpm2_shutdown
 swtpm_ioctl --unix ${SOCKET}.ctrl -s
 

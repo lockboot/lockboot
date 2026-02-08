@@ -33,15 +33,10 @@ AMAZON_KERNEL_RPM_aarch64 := $(AMAZON_KERNEL_PACKAGE)-$(AMAZON_KERNEL_VERSION).a
 AMAZON_KERNEL_URL_x86_64 := https://cdn.amazonlinux.com/al2023/blobstore/$(AMAZON_KERNEL_SHA256_x86_64)/$(AMAZON_KERNEL_RPM_x86_64)
 AMAZON_KERNEL_URL_aarch64 := https://cdn.amazonlinux.com/al2023/blobstore/$(AMAZON_KERNEL_SHA256_aarch64)/$(AMAZON_KERNEL_RPM_aarch64)
 
-# Amazon EC2 Metadata Mock
-AEMM_VERSION := v1.13.0
-AEMM_URL := https://github.com/aws/amazon-ec2-metadata-mock/releases/download/$(AEMM_VERSION)/ec2-metadata-mock-linux-amd64
-AEMM_SHA256 := 4f89ddc71ac53ce540bda1f9c340526d558eed8e41349761f2798acf1b254950
-
 ARCHS = x86_64 aarch64
 TARGETS = busybox stub.efi kernel.rpm
 
-all: $(ARCHS) ec2-metadata-mock-linux-amd64
+all: $(ARCHS)
 
 x86_64: $(addprefix x86_64/,$(TARGETS))
 aarch64: $(addprefix aarch64/,$(TARGETS))
@@ -85,17 +80,12 @@ aarch64/$(AMAZON_KERNEL_RPM_aarch64):
 aarch64/kernel.rpm: aarch64/$(AMAZON_KERNEL_RPM_aarch64)
 	@ln -sf $(notdir $<) $@
 
-# Download Amazon EC2 Metadata Mock
-ec2-metadata-mock-linux-amd64:
-	@./download-and-verify.sh "$@" "$(AEMM_SHA256)" "$(AEMM_URL)"
-	@chmod +x $@
-
 # Retrieve package URLs from dnf
 kernel-hash-%:
 	docker run --rm --platform linux/amd64 amazonlinux:latest bash -c "dnf repoquery --forcearch=$* --arch=$* --location $(AMAZON_KERNEL_PACKAGE)-$(AMAZON_KERNEL_VERSION).$*"
 
 clean:
-	rm -rf x86_64 aarch64 ec2-metadata-mock-linux-amd64
+	rm -rf x86_64 aarch64
 
 # Check all download URLs are still valid
 check-urls:
@@ -106,4 +96,3 @@ check-urls:
 	@curl -sfI "$(SYSTEMD_BOOT_URL_aarch64)" > /dev/null && echo "OK: systemd-boot aarch64" || echo "FAIL: systemd-boot aarch64"
 	@curl -sfI "$(AMAZON_KERNEL_URL_x86_64)" > /dev/null && echo "OK: kernel x86_64" || echo "FAIL: kernel x86_64"
 	@curl -sfI "$(AMAZON_KERNEL_URL_aarch64)" > /dev/null && echo "OK: kernel aarch64" || echo "FAIL: kernel aarch64"
-	@curl -sfI "$(AEMM_URL)" > /dev/null && echo "OK: ec2-metadata-mock" || echo "FAIL: ec2-metadata-mock"

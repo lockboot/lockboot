@@ -29,7 +29,6 @@ qemu-10.*
 __pycache__
 old
 .docker
-aarch64
-x86_64
 user-data.json
 .bashrc
+.lesshst

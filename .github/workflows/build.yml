@@ -27,11 +27,11 @@ jobs:
         with:
           name: ${{ matrix.arch }}
           path: |
-            ${{ matrix.arch }}/boot.disk
-            ${{ matrix.arch }}/busybox
-            ${{ matrix.arch }}/stage1
-            ${{ matrix.arch }}/os-release
-            ${{ matrix.arch }}/efi-vars.*
+            tools/build-uki/${{ matrix.arch }}/boot.disk
+            tools/build-uki/${{ matrix.arch }}/busybox
+            tools/build-uki/${{ matrix.arch }}/stage1
+            tools/build-uki/${{ matrix.arch }}/os-release
+            tools/build-uki/${{ matrix.arch }}/efi-vars.*
   
   release-docker:
     runs-on: ubuntu-latest
@@ -51,13 +51,13 @@ jobs:
         uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
         with:
           name: x86_64
-          path: x86_64
+          path: tools/build-uki/x86_64
 
       - name: Download aarch64 artifacts
         uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
         with:
           name: aarch64
-          path: aarch64
+          path: tools/build-uki/aarch64
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@c47758b77c9736f4b2ef4073d4d51994fabfe349 # v3.7.1

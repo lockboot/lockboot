@@ -144,6 +144,18 @@ Before executing stage2, the TPM PCRs are extended with cryptographic measuremen
 | **PCR 14** | Stage2 Binary | SHA256 hash of the downloaded binary |
 | **PCR 15** | Configuration | SHA256 hash of the entire JSON config |
 
+## Attestation Trust Model
+
+The attestation is generated in the **virgin state** - before any user-provided code runs and before PCRs are extended. This ordering is critical, but it only provides security guarantees because the AK is a **restricted signing key**.
+
+A restricted signing key can only sign digests that the TPM itself produces. When the AK signs a `TPM2_Quote`, the quote contains the actual PCR values at signing time - generated internally by the TPM, not by software. This means even if stage2 has access to the AK handle, it can only produce quotes reflecting the *current* PCR state (with stage2 already measured into PCR14). It cannot forge a quote showing virgin-state PCRs.
+
+Without the restricted key constraint, the trust model collapses into tautology: stage2 could simply sign "I'm in virgin state" and the attestation would prove nothing.
+
+The attestation uses `H(H(binary) || H(config))` as the nonce - a hash of the binary hash concatenated with the config hash - binding the attestation to the specific intended workload. Once this virgin-state attestation exists, any future use of the same AK inherits this trust anchor. A verifier can reason: "this AK was attested in a clean PCR state with config X, therefore subsequent quotes from this AK come from a system that started from that trusted state."
+
+The restricted signing constraint is imposed by cloud vTPMs (notably GCP), which limits the AK to operations like `TPM2_Quote`, `TPM2_Certify`, and `TPM2_CertifyCreation`. While this can feel limiting, it's precisely what makes the trust model sound.
+
 ## Building
 
 From the repository root:
