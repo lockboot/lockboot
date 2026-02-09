@@ -10,7 +10,7 @@ KEYDIR="${SCRIPT_DIR}/keys"
 # Get architecture from environment (default to x86_64)
 ARCH=${ARCH:-x86_64}
 
-echo "=== Building UKI for Amazon Linux 2023 (${ARCH}) ==="
+echo "=== Building UKI for Fedora 41 (${ARCH}) ==="
 
 # Output directory (same as dependencies - everything self-contained)
 OUTPUT_DIR="${SCRIPT_DIR}/${ARCH}"
@@ -28,20 +28,24 @@ else
     exit 1
 fi
 
-# Use systemd-boot stub extracted by Makefile from Amazon Linux RPM
+# Use systemd-boot stub extracted by Makefile from Fedora 41 RPM (systemd v256)
 if [ ! -f "${OUTPUT_DIR}/stub.efi" ]; then
     echo "ERROR: systemd-boot stub not found at ${OUTPUT_DIR}/stub.efi"
     echo "Please run 'make tools/build-uki/${ARCH}/stub.efi' first"
     exit 1
 fi
 
-echo "Extracting kernel RPM..."
-rpm2cpio "${OUTPUT_DIR}"/kernel6.12-*.rpm | (cd "${OUTPUT_DIR}/tmp" && cpio --quiet -idmu)
+echo "Extracting kernel-core RPM (vmlinuz)..."
+rpm2cpio "${OUTPUT_DIR}"/kernel-core-*.rpm | (cd "${OUTPUT_DIR}/tmp" && cpio --quiet -idmu)
+
+echo "Extracting kernel-modules-core RPM (core drivers including gve and ena)..."
+rpm2cpio "${OUTPUT_DIR}"/kernel-modules-core-*.rpm | (cd "${OUTPUT_DIR}/tmp" && cpio --quiet -idmu)
+
 if [ ! -d "${OUTPUT_DIR}/tmp/lib/modules" ]; then
-    echo "ERROR: kernel modules not found after extraction!"
+    echo "ERROR: kernel modules directory not found after extraction!"
     exit 1
 fi
-echo "Kernel extracted successfully"
+echo "Kernel and modules extracted successfully"
 
 # Find the installed kernel version
 KERNEL_VERSION=$(ls "${OUTPUT_DIR}/tmp/lib/modules/" | head -n1)
@@ -91,23 +95,10 @@ MODULES_SRC="${OUTPUT_DIR}/tmp/lib/modules/${KERNEL_VERSION}"
 MODULES_DST="${INITRAMFS_DIR}/lib/modules/${KERNEL_VERSION}"
 mkdir -p "${MODULES_DST}/kernel/drivers"
 
-# Copy required modules for Nitro Enclave host
-# Note: This is for the HOST EC2 instance, not the enclave itself
+# Copy required modules for cloud instances (AWS EC2, GCP Confidential VMs)
+# Note: Some modules like virtio, virtio_pci, hw_random, efivarfs are built into the kernel (=y)
 REQUIRED_MODULES=(
-    # EFI variable filesystem (for Secure Boot key management)
-    "fs/efivarfs/efivarfs.ko"
-
-    # Virtio base modules
-    "drivers/virtio/virtio.ko"
-    "drivers/virtio/virtio_ring.ko"
-
-    # Virtio PCI dependencies (must come before virtio_pci)
-    "drivers/virtio/virtio_pci_modern_dev.ko"
-    "drivers/virtio/virtio_pci_legacy_dev.ko"
-    "drivers/virtio/virtio_pci.ko"
-
-    # Hardware RNG modules
-    "drivers/char/hw_random/rng-core.ko"
+    # Hardware RNG modules (base is built-in, vendor-specific are modules)
     "drivers/char/hw_random/intel-rng.ko"
     "drivers/char/hw_random/amd-rng.ko"
 
@@ -116,14 +107,17 @@ REQUIRED_MODULES=(
     "drivers/net/net_failover.ko"
     "drivers/net/virtio_net.ko"
 
-    # EC2 ENA network driver (for real EC2 instances)
-    "drivers/amazon/net/ena/ena.ko"
+    # EC2 ENA network driver (for AWS EC2 instances)
+    "drivers/net/ethernet/amazon/ena/ena.ko"
+
+    # GCP GVE network driver (for GCP Confidential VMs)
+    "drivers/net/ethernet/google/gve/gve.ko"
 
     # Vsock modules
     "net/vmw_vsock/vsock.ko"
     "net/vmw_vsock/vmw_vsock_virtio_transport_common.ko"
 
-    # Vhost dependencies (must come before vhost)
+    # Vhost dependencies
     "drivers/vhost/vhost_iotlb.ko"
     "drivers/vhost/vhost.ko"
     "drivers/vhost/vhost_vsock.ko"
@@ -134,13 +128,20 @@ REQUIRED_MODULES=(
 )
 
 for mod_path in "${REQUIRED_MODULES[@]}"; do
+    # Try both .ko and .ko.xz (Fedora compresses modules, need to decompress for busybox modprobe)
     if [ -f "${MODULES_SRC}/kernel/${mod_path}" ]; then
         mod_dir=$(dirname "${mod_path}")
         mkdir -p "${MODULES_DST}/kernel/${mod_dir}"
         cp "${MODULES_SRC}/kernel/${mod_path}" "${MODULES_DST}/kernel/${mod_dir}/"
         echo "  Copied ${mod_path}"
+    elif [ -f "${MODULES_SRC}/kernel/${mod_path}.xz" ]; then
+        mod_dir=$(dirname "${mod_path}")
+        mkdir -p "${MODULES_DST}/kernel/${mod_dir}"
+        # Decompress xz modules for busybox modprobe (kernel doesn't support compressed modules)
+        xz -dc "${MODULES_SRC}/kernel/${mod_path}.xz" > "${MODULES_DST}/kernel/${mod_path}"
+        echo "  Copied and decompressed ${mod_path}.xz"
     else
-        echo "  Warning: Module ${mod_path} not found"
+        echo "  Warning: Module ${mod_path} not found (may be built into kernel)"
     fi
 done
 
@@ -201,16 +202,16 @@ UKI_PATH="${OUTPUT_DIR}/linux.efi"
 # Create cmdline file with architecture-specific console settings
 CMDLINE_PATH="${OUTPUT_DIR}/cmdline.txt"
 if [ "${ARCH}" = "x86_64" ]; then
-    # x86_64: ttyS0 for serial console
-    # Last console= becomes the primary output device
-    echo "console=tty0 console=ttyS0,115200n8 ro" > "${CMDLINE_PATH}"
+    # earlycon: auto-detect via ACPI SPCR table for early boot output
+    # console=ttyS0: EC2 PCI UART (only serial device, gets ttyS0)
+    # console=ttyS1: QEMU q35 ISA serial (default COM1 is ttyS0 with no backend,
+    #                explicit isa-serial device becomes ttyS1)
+    echo "earlycon console=ttyS0,115200n8 console=ttyS1,115200n8 ro" > "${CMDLINE_PATH}"
 else
-    # aarch64: Support both QEMU (ttyAMA0/pl011) and EC2 (ttyS0/uart)
-    # QEMU SPCR: pl011,mmio,0x9000000 -> ttyAMA0
-    # EC2 SPCR:  uart,mmio,0x90a0000 -> ttyS0
-    # Last console becomes primary, kernel uses whichever exists
-    #echo "earlyprintk=serial,ttyS0 console=ttyAMA0 ro" > "${CMDLINE_PATH}"
-    echo "console=tty0 console=ttyAMA0,115200n8 console=ttyS0,115200n8 ro" > "${CMDLINE_PATH}"
+    # earlycon: auto-detect via SPCR (arm64 also auto-registers SPCR as regular console)
+    # console=ttyAMA0: PL011 UART on QEMU virt
+    # console=ttyS0: 16550 PCI UART on EC2 Graviton and QEMU (PCI serial)
+    echo "earlycon console=ttyAMA0,115200n8 console=ttyS0,115200n8 ro" > "${CMDLINE_PATH}"
 fi
 
 UNAME_PATH="${OUTPUT_DIR}/uname.txt"
@@ -219,15 +220,15 @@ echo "${KERNEL_VERSION}" > "${UNAME_PATH}"
 # Set SOURCE_DATE_EPOCH for reproducible builds
 export SOURCE_DATE_EPOCH=0
 
-# Generate version with year.month format (e.g., 25.11)
+# Generate version with year.month format (e.g., 26.02)
 YEAR_MONTH=$(date +%y.%m)
-OSREL_VERSION="${YEAR_MONTH} ${ARCH} (Amazon Linux 2023)"
+OSREL_VERSION="${YEAR_MONTH} ${ARCH} (Fedora 41)"
 OSREL_NAME="Lock.Boot"
 # Combine stub + kernel + initrd into UKI
 # Use os-release from extracted RPM if available, otherwise create minimal one
 OSREL_PATH="${OUTPUT_DIR}/os-release"
 echo "ID=lockboot" > "${OSREL_PATH}"
-echo "VERSION_ID=${YEAR_MONTH}.al2023" >> "${OSREL_PATH}"
+echo "VERSION_ID=${YEAR_MONTH}.fc41" >> "${OSREL_PATH}"
 echo "VERSION=\"${OSREL_VERSION}\"" >> "${OSREL_PATH}"
 echo "NAME=\"${OSREL_NAME}\"" >> "${OSREL_PATH}"
 echo "PRETTY_NAME=\"${OSREL_NAME} ${OSREL_VERSION}\"" >> "${OSREL_PATH}"
@@ -239,14 +240,47 @@ CMDLINE_HASH=$(sha256sum "${CMDLINE_PATH}" | cut -d' ' -f1 | cut -c1-8)
 BUILD_ID="kernel-${KERNEL_VERSION}-${KERNEL_HASH}.cmdline-${CMDLINE_HASH}.initrd-${INITRD_HASH}"
 echo "BUILD_ID=${BUILD_ID}" >> "${OSREL_PATH}"
 
+# Calculate section VMAs dynamically based on the stub's layout.
+# Newer systemd stubs (v256+) use high VMAs that differ from v252's layout,
+# so we append our sections after the stub's last section (same approach as ukify).
+SECTION_ALIGN=0x1000
+NEXT_VMA=$(${OBJCOPY%%objcopy}objdump -h "${STUB_PATH}" | \
+    awk '/^  [0-9]/ { print $3, $4 }' | \
+    while read size_hex vma_hex; do
+        echo $(( 0x${vma_hex} + 0x${size_hex} ))
+    done | sort -n | tail -1)
+NEXT_VMA=$(( (NEXT_VMA + SECTION_ALIGN - 1) / SECTION_ALIGN * SECTION_ALIGN ))
+
+# Place each section sequentially, aligned to SECTION_ALIGN
+calc_next_vma() {
+    local current_vma=$1
+    local file=$2
+    local size
+    size=$(stat -c%s "$file")
+    echo $(( (current_vma + size + SECTION_ALIGN - 1) / SECTION_ALIGN * SECTION_ALIGN ))
+}
+
+OSREL_VMA=${NEXT_VMA}
+CMDLINE_VMA=$(calc_next_vma ${OSREL_VMA} "${OSREL_PATH}")
+UNAME_VMA=$(calc_next_vma ${CMDLINE_VMA} "${CMDLINE_PATH}")
+LINUX_VMA=$(calc_next_vma ${UNAME_VMA} "${UNAME_PATH}")
+INITRD_VMA=$(calc_next_vma ${LINUX_VMA} "${KERNEL_PATH}")
+
+echo "UKI section layout:"
+printf "  .osrel   @ 0x%x\n" ${OSREL_VMA}
+printf "  .cmdline @ 0x%x\n" ${CMDLINE_VMA}
+printf "  .uname   @ 0x%x\n" ${UNAME_VMA}
+printf "  .linux   @ 0x%x\n" ${LINUX_VMA}
+printf "  .initrd  @ 0x%x\n" ${INITRD_VMA}
+
 ${OBJCOPY} \
     --input-target="${PE_FORMAT}" \
     --output-target="${PE_FORMAT}" \
-    --add-section .osrel="${OSREL_PATH}" --change-section-vma .osrel=0x20000 \
-    --add-section .cmdline="${CMDLINE_PATH}" --change-section-vma .cmdline=0x30000 \
-    --add-section .uname="${UNAME_PATH}" --change-section-vma .uname=0x40000 \
-    --add-section .linux="${KERNEL_PATH}" --change-section-vma .linux=0x2000000 \
-    --add-section .initrd="${INITRD_PATH}" --change-section-vma .initrd=0x3000000 \
+    --add-section .osrel="${OSREL_PATH}" --change-section-vma .osrel=${OSREL_VMA} \
+    --add-section .cmdline="${CMDLINE_PATH}" --change-section-vma .cmdline=${CMDLINE_VMA} \
+    --add-section .uname="${UNAME_PATH}" --change-section-vma .uname=${UNAME_VMA} \
+    --add-section .linux="${KERNEL_PATH}" --change-section-vma .linux=${LINUX_VMA} \
+    --add-section .initrd="${INITRD_PATH}" --change-section-vma .initrd=${INITRD_VMA} \
     "${STUB_PATH}" "${UKI_PATH}"
 
 sbsign --key "$KEYDIR/db.crt.key" --cert "$KEYDIR/db.crt" --output "${UKI_PATH}" "${UKI_PATH}"

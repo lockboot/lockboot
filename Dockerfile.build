@@ -26,7 +26,8 @@ RUN apt-get -qq update && \
     sbsigntool \
     util-linux \
     uuid-runtime \
-    wget && \
+    wget \
+    xz-utils && \
     pip3 install --break-system-packages virt-firmware
 
 # Reproducible builds environment

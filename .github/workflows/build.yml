@@ -22,6 +22,11 @@ jobs:
       - name: Build UKI for ${{ matrix.arch }}
         run: make ${{ matrix.arch }}
 
+      - name: Copy public keys to arch directory
+        run: |
+          cp tools/build-uki/keys/*.cer tools/build-uki/${{ matrix.arch }}/
+          cp tools/build-uki/keys/*.guid tools/build-uki/${{ matrix.arch }}/
+
       - name: Upload UKI artifacts for ${{ matrix.arch }}
         uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
         with:
@@ -32,6 +37,8 @@ jobs:
             tools/build-uki/${{ matrix.arch }}/stage1
             tools/build-uki/${{ matrix.arch }}/os-release
             tools/build-uki/${{ matrix.arch }}/efi-vars.*
+            tools/build-uki/${{ matrix.arch }}/*.cer
+            tools/build-uki/${{ matrix.arch }}/*.guid
   
   release-docker:
     runs-on: ubuntu-latest

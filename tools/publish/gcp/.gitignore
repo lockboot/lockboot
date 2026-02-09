@@ -1,0 +1,4 @@
+# Local gcloud SDK installation
+google-cloud-sdk/
+google-cloud-cli-*.tar.gz
+gcloud
