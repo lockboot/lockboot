@@ -50,6 +50,9 @@ if [ "${ARCH}" = "x86_64" ]; then
     QEMU_MACHINE="-machine q35,smm=on"
     QEMU_CPU=""
     QEMU_EXTRA="-enable-kvm"
+    # ISA serial at 0x3f8 = ttyS0, matches how GRUB/Fedora expects serial on x86_64
+    QEMU_SERIAL="-serial none"
+    QEMU_SERIAL_DEVICE="-device isa-serial,chardev=char0"
     TPM_DEVICE="tpm-tis"
 elif [ "${ARCH}" = "aarch64" ]; then
     OVMF_CODE="/usr/share/AAVMF/AAVMF_CODE.fd"
@@ -64,7 +67,10 @@ elif [ "${ARCH}" = "aarch64" ]; then
     # -cpu max (all features, but may cause issues)
     QEMU_CPU="-cpu cortex-a72"
     #QEMU_CPU=""
-    QEMU_EXTRA="" # ttyS0
+    QEMU_EXTRA=""
+    # -serial none: PL011 exists but with no backend, PCI serial is ttyS0
+    QEMU_SERIAL="-serial none"
+    QEMU_SERIAL_DEVICE="-device pci-serial,id=serial0,chardev=char0"
     TPM_DEVICE="tpm-tis-device"
 else
     echo "Error: Unsupported architecture: ${ARCH}"
@@ -190,8 +196,8 @@ ${QEMU_CMD} \
     -netdev tap,id=net0,ifname=tap0,script=no \
     -device virtio-net-pci,netdev=net0 \
     -display none \
-    -serial none \
+    ${QEMU_SERIAL} \
     -chardev stdio,mux=on,id=char0 \
-    -device pci-serial,id=serial0,chardev=char0 \
+    ${QEMU_SERIAL_DEVICE} \
     -drive if=pflash,format=raw,unit=0,file="${OVMF_CODE}",readonly=on \
     -drive if=pflash,format=raw,unit=1,file="${OVMF_VARS}" || true

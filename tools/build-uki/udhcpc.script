@@ -10,7 +10,11 @@ case "$1" in
         ;;
     bound|renew)
         /bin/busybox ip addr add $ip/$mask dev $interface
-        [ -n "$router" ] && /bin/busybox ip route add default via $router dev $interface
+        if [ -n "$router" ]; then
+            # Add link-local route to gateway (required for /32 subnets like GCP)
+            /bin/busybox ip route add $router dev $interface 2>/dev/null || true
+            /bin/busybox ip route add default via $router dev $interface
+        fi
 
         # Set hostname from DHCP (option 12)
         [ -n "$hostname" ] && /bin/busybox hostname "$hostname"

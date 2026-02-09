@@ -36,8 +36,11 @@ tools/build-uki/%/busybox:
 tools/build-uki/%/stub.efi:
 	$(MAKE) -C tools/build-uki $*/stub.efi
 
-tools/build-uki/%/kernel.rpm:
-	$(MAKE) -C tools/build-uki $*/kernel.rpm
+tools/build-uki/%/kernel-core.rpm:
+	$(MAKE) -C tools/build-uki $*/kernel-core.rpm
+
+tools/build-uki/%/kernel-modules-core.rpm:
+	$(MAKE) -C tools/build-uki $*/kernel-modules-core.rpm
 
 tools/qemu-test/%:
 	$(MAKE) -C tools/qemu-test $*
@@ -130,7 +133,7 @@ docker-shell-dev: docker-build-dev
 
 # Build the UKI and boot disk for a specific architecture
 # This creates: UKI, disk image with EFI boot structure
-tools/build-uki/%/boot.disk: tools/build-uki/%/busybox tools/build-uki/%/stage1 tools/build-uki/%/stub.efi tools/build-uki/%/kernel.rpm tools/build-uki/keys/db.crt
+tools/build-uki/%/boot.disk: tools/build-uki/%/busybox tools/build-uki/%/stage1 tools/build-uki/%/stub.efi tools/build-uki/%/kernel-core.rpm tools/build-uki/%/kernel-modules-core.rpm tools/build-uki/keys/db.crt
 	$(DOCKER_RUN) $(DOCKER_OPT_DOCKER) -e ARCH=$* \
 		$(BUILD_IMAGE) ./tools/build-uki/build.sh
 

@@ -7,8 +7,9 @@ $BB mount -t sysfs none /sys
 $BB mount -t devtmpfs none /dev
 $BB mount -t tmpfs none /tmp
 
-$BB modprobe efivarfs
-$BB mount -t efivarfs none /sys/firmware/efi/efivars
+# Skip efivarfs - not needed after firmware stage
+# $BB modprobe efivarfs
+# $BB mount -t efivarfs none /sys/firmware/efi/efivars
 
 # Load hardware RNG modules
 $BB modprobe rng-core
@@ -19,7 +20,8 @@ $BB modprobe failover
 $BB modprobe net_failover
 $BB modprobe virtio_pci
 $BB modprobe virtio_net
-$BB modprobe ena
+$BB modprobe gve 2>/dev/null || echo "[WARN] gve driver not available"
+$BB modprobe ena 2>/dev/null || true
 $BB modprobe vsock
 $BB modprobe vhost
 $BB modprobe vhost_vsock
