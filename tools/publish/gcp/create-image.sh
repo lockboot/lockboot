@@ -90,10 +90,14 @@ fi
 IMAGE_FILE="${WORK_DIR}/boot.disk"
 OS_RELEASE_FILE="${WORK_DIR}/os-release"
 
-# Get keys directory (same for local and release builds)
+# Get keys directory: from extracted release (flat) or from repo (keys/ subdir)
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
-KEYS_DIR="${REPO_ROOT}/tools/build-uki/keys"
+if [ -f "${WORK_DIR}/db.cer" ]; then
+    KEYS_DIR="${WORK_DIR}"
+else
+    KEYS_DIR="${REPO_ROOT}/tools/build-uki/keys"
+fi
 
 if [ ! -f "${OS_RELEASE_FILE}" ]; then
     echo "Error: ${OS_RELEASE_FILE} not found"

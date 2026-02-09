@@ -126,12 +126,21 @@ else
     echo "No existing snapshot found, creating new one..."
     echo ""
     echo "=== Checking if image exists in S3 ==="
+    S3_KEY="${S3_KEY}.vmdk"
     if aws s3api head-object --bucket "${S3_BUCKET}" --key "${S3_KEY}" --region "${REGION}" &>/dev/null; then
         echo "Image already exists in S3: s3://${S3_BUCKET}/${S3_KEY}"
     else
-        echo "Uploading image to S3..."
+        echo "Converting raw disk to stream-optimized VMDK (compresses sparse regions)..."
+        VMDK_FILE="${WORK_DIR}/boot.vmdk"
+        qemu-img convert -f raw -O vmdk -o subformat=streamOptimized "${IMAGE_FILE}" "${VMDK_FILE}"
+        RAW_SIZE=$(stat -c%s "${IMAGE_FILE}" 2>/dev/null || stat -f%z "${IMAGE_FILE}")
+        VMDK_SIZE=$(stat -c%s "${VMDK_FILE}" 2>/dev/null || stat -f%z "${VMDK_FILE}")
+        echo "Compressed: $(( RAW_SIZE / 1024 / 1024 ))MB raw -> $(( VMDK_SIZE / 1024 / 1024 ))MB vmdk"
+
+        echo "Uploading VMDK to S3..."
         echo "Bucket: s3://${S3_BUCKET}/${S3_KEY}"
-        aws s3 cp "${IMAGE_FILE}" "s3://${S3_BUCKET}/${S3_KEY}" --region "${REGION}"
+        aws s3 cp "${VMDK_FILE}" "s3://${S3_BUCKET}/${S3_KEY}" --region "${REGION}"
+        rm -f "${VMDK_FILE}"
     fi
 
     echo ""
@@ -141,7 +150,7 @@ else
     cat > containers.json << EOF
 {
   "Description": "${SNAPSHOT_DESC}",
-  "Format": "raw",
+  "Format": "vmdk",
   "UserBucket": {
     "S3Bucket": "${S3_BUCKET}",
     "S3Key": "${S3_KEY}"
@@ -252,10 +261,13 @@ echo ""
 
 # Suggest appropriate instance type based on architecture
 if [ "${ARCH}" == "aarch64" ]; then
-    INSTANCE_TYPE="t4g.micro"
+    INSTANCE_TYPE="c7g.medium"
 else
     INSTANCE_TYPE="c6i.large"
 fi
 
-echo "You can now launch instances using:"
+echo "Launch an instance:"
 echo "  aws ec2 run-instances --image-id ${AMI_ID} --instance-type ${INSTANCE_TYPE} --region ${REGION} --user-data file://config.json"
+echo ""
+echo "Get serial console output:"
+echo "  aws ec2 get-console-output --output text --latest --region ${REGION} --instance-id <instance-id>"
