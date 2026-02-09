@@ -44,16 +44,36 @@ You can run any statically linked Linux ELF, but the minimal filesystem only has
 
 ## Cloud Deployment
 
-Deploy the same config across AWS, GCP, or Azure:
+Deploy the same config across AWS, GCP, or Azure. Publish scripts are provided in `tools/publish/`.
+
+### AWS EC2
+
+Requires Nitro v4+ instances with TPM 2.0 and UEFI boot support:
+
+| Architecture | Tested Instance | Notes |
+|---|---|---|
+| x86_64 | `c6i.large` | Intel Xeon Gen 3, Nitro v4 |
+| aarch64 | `c7g.medium` | Graviton 3, Nitro v4 |
 
 ```bash
-# AWS
-aws ec2 run-instances --user-data file://user-data.json --tpm-support v2.0 ...
+tools/publish/ec2/create-ami.sh us-east-1 x86_64 local
+```
 
-# GCP
-gcloud compute instances create --metadata user-data="$(cat user-data.json)" ...
+### GCP Confidential VMs
 
-# Azure
+Requires Confidential VM instances with Shielded VM and custom Secure Boot keys. Uses GVE network driver (virtio-net not available on Confidential VMs).
+
+| Architecture | Tested Instance | Notes |
+|---|---|---|
+| x86_64 | `n2d-standard-2` | AMD SEV-SNP |
+
+```bash
+tools/publish/gcp/create-image.sh my-project x86_64 local
+```
+
+### Azure
+
+```bash
 az vm create --user-data "$(cat user-data.json | base64 -w0)" ...
 ```
 
