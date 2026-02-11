@@ -1,6 +1,12 @@
 #!/bin/busybox sh
-set -xe
+set -eu
 BB=/bin/busybox
+
+# Log to kernel ring buffer so timestamps match printk's clock
+kmsg() { echo "$*" > /dev/kmsg; }
+log()  { kmsg "<6>init: $*"; }
+warn() { kmsg "<4>init: $*"; }
+die()  { kmsg "<3>init: $*"; $BB poweroff -f; }
 
 #####################################################################
 # Mount essential filesystems
@@ -9,6 +15,7 @@ $BB mount -t proc none /proc
 $BB mount -t sysfs none /sys
 $BB mount -t devtmpfs none /dev
 $BB mount -t tmpfs none /tmp
+log "Filesystems mounted"
 
 # Skip efivarfs - not needed after firmware stage
 # $BB modprobe efivarfs
@@ -17,6 +24,7 @@ $BB mount -t tmpfs none /tmp
 #####################################################################
 # Load kernel modules
 #
+log "Loading kernel modules"
 $BB modprobe rng-core
 $BB modprobe intel-rng 2>/dev/null || true
 $BB modprobe amd-rng 2>/dev/null || true
@@ -25,7 +33,7 @@ $BB modprobe failover
 $BB modprobe net_failover
 $BB modprobe virtio_pci
 $BB modprobe virtio_net
-$BB modprobe gve 2>/dev/null || echo "[WARN] gve driver not available"
+$BB modprobe gve 2>/dev/null || warn "gve driver not available"
 $BB modprobe ena 2>/dev/null || true
 $BB modprobe vsock
 $BB modprobe vhost
@@ -35,20 +43,24 @@ $BB modprobe nitro_enclaves
 #####################################################################
 # Setup networking
 #
+log "Setting up networking"
 $BB ip link set lo up
 # Find first non-loopback interface
 ETH_IFACE=$($BB ip link show | $BB grep -v loopback | $BB grep -v 'lo:' | $BB head -1 | $BB awk '{print $2}' | $BB sed 's/://')
 if [ -n "$ETH_IFACE" ]; then
 	$BB ip link set "$ETH_IFACE" up
-	$BB udhcpc -i "$ETH_IFACE" -n -s /bin/udhcpc.script
+	$BB udhcpc -i "$ETH_IFACE" -n -s /bin/udhcpc.script 2>&1 | while IFS= read -r line; do kmsg "<6>$line"; done
+	# Pipeline swallows exit code (no pipefail in ash), so verify we got an IP
+	$BB ip addr show "$ETH_IFACE" | $BB grep -q 'inet ' || { log "DHCP failed on $ETH_IFACE"; $BB poweroff -f; }
 else
-	echo "[ERROR] No network interface found"
-    $BB poweroff -f
-    exit
+	log "No network interface found"
+	$BB poweroff -f
+	exit
 fi
 
 #####################################################################
 # Lock down kernel before handing off to stage1/stage2.
+log "Locking down kernel"
 #
 # One-way toggles (irreversible, even by root):
 echo 1 > /proc/sys/kernel/modules_disabled      # No more module loading, even signed
@@ -124,6 +136,7 @@ echo 4194304 > /proc/sys/kernel/pid_max                    # Larger PID space (F
 
 #####################################################################
 # Finally, exec stage1
+log "Executing stage1"
 exec /bin/stage1
 
 #####################################################################
