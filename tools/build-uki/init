@@ -1,7 +1,10 @@
 #!/bin/busybox sh
 set -xe
 BB=/bin/busybox
+
+#####################################################################
 # Mount essential filesystems
+#
 $BB mount -t proc none /proc
 $BB mount -t sysfs none /sys
 $BB mount -t devtmpfs none /dev
@@ -11,7 +14,9 @@ $BB mount -t tmpfs none /tmp
 # $BB modprobe efivarfs
 # $BB mount -t efivarfs none /sys/firmware/efi/efivars
 
-# Load hardware RNG modules
+#####################################################################
+# Load kernel modules
+#
 $BB modprobe rng-core
 $BB modprobe intel-rng 2>/dev/null || true
 $BB modprobe amd-rng 2>/dev/null || true
@@ -27,6 +32,9 @@ $BB modprobe vhost
 $BB modprobe vhost_vsock
 $BB modprobe nitro_enclaves
 
+#####################################################################
+# Setup networking
+#
 $BB ip link set lo up
 # Find first non-loopback interface
 ETH_IFACE=$($BB ip link show | $BB grep -v loopback | $BB grep -v 'lo:' | $BB head -1 | $BB awk '{print $2}' | $BB sed 's/://')
@@ -39,9 +47,88 @@ else
     exit
 fi
 
+#####################################################################
+# Lock down kernel before handing off to stage1/stage2.
+#
+# One-way toggles (irreversible, even by root):
+echo 1 > /proc/sys/kernel/modules_disabled      # No more module loading, even signed
+echo 1 > /proc/sys/kernel/kexec_load_disabled   # No kexec, defense-in-depth with lockdown
+echo 1 > /proc/sys/kernel/unprivileged_bpf_disabled  # Permanently disable unprivileged BPF (one-way)
+# SysRq: operator can send BREAK+key via serial console API to dump kernel state
+# (SysRq+l/m/p) or trigger panic (SysRq+c). lockdown does NOT block SysRq.
+# This is a sysctl, not a kernel cmdline param. /proc/sysrq-trigger still works
+# for root, but that's within stage2's existing privilege boundary.
+echo 0 > /proc/sys/kernel/sysrq                 # Disable SysRq via keyboard/serial
+# Reversible but raises the bar:
+echo 2 > /proc/sys/kernel/kptr_restrict         # Hide kernel pointers from root
+echo 3 > /proc/sys/kernel/perf_event_paranoid   # Disallow all perf events
+echo 3 > /proc/sys/kernel/yama/ptrace_scope     # No ptrace at all
+echo 1 > /proc/sys/kernel/dmesg_restrict        # Restrict dmesg to CAP_SYSLOG
+echo 2 > /proc/sys/net/core/bpf_jit_harden      # Harden BPF JIT for all users
+# Fail closed: crash immediately on abnormal conditions rather than continuing
+# in a potentially exploitable state. crashkernel=0 + lockdown ensures no
+# memory dump is produced on panic.
+echo 0 > /proc/sys/kernel/nmi_watchdog          # Disable NMI watchdog (hypervisor monitors liveness)
+echo 1 > /proc/sys/kernel/panic_on_oops         # Panic on oops (also set via cmdline oops=panic)
+echo 1 > /proc/sys/kernel/softlockup_panic      # Panic on soft lockup
+[ -f /proc/sys/kernel/hung_task_panic ] && echo 1 > /proc/sys/kernel/hung_task_panic  # Panic on hung task
+# x86-only NMI sysctls (not present on aarch64):
+[ -f /proc/sys/kernel/panic_on_io_nmi ] && echo 1 > /proc/sys/kernel/panic_on_io_nmi
+[ -f /proc/sys/kernel/panic_on_unrecovered_nmi ] && echo 1 > /proc/sys/kernel/panic_on_unrecovered_nmi
+[ -f /proc/sys/kernel/unknown_nmi_panic ] && echo 1 > /proc/sys/kernel/unknown_nmi_panic
+
+#####################################################################
+# Prudent protection: standard hardening that systemd would normally
+# apply via sysctl.d. Since we don't run systemd, stage2 users would
+# otherwise get an unhardened baseline.
+#
+# Core dumps:
+echo /dev/null > /proc/sys/kernel/core_pattern               # Discard all core dumps
+echo 0 > /proc/sys/fs/suid_dumpable                 # No core dumps from setuid programs
+# Filesystem protections:
+echo 1 > /proc/sys/fs/protected_hardlinks            # Block hardlink-based privesc
+echo 1 > /proc/sys/fs/protected_symlinks             # Block symlink attacks in sticky dirs
+echo 2 > /proc/sys/fs/protected_fifos                # Block FIFO attacks in sticky dirs
+echo 2 > /proc/sys/fs/protected_regular              # Block regular file attacks in sticky dirs
+# Address space:
+echo 2 > /proc/sys/kernel/randomize_va_space         # Full ASLR
+# Attack surface reduction (stage2 can re-enable as root if needed):
+echo 0 > /proc/sys/vm/unprivileged_userfaultfd       # Disable unprivileged userfaultfd (heap race primitive)
+echo 2 > /proc/sys/kernel/io_uring_disabled           # Disable io_uring for all users (prolific CVE source)
+echo 0 > /proc/sys/user/max_user_namespaces           # Disable user namespaces (unlocks large attack surface)
+echo 0 > /proc/sys/dev/tty/ldisc_autoload             # No auto-loading TTY line disciplines (exploit target)
+echo 0 > /proc/sys/dev/tty/legacy_tiocsti             # Disable TIOCSTI terminal injection ioctl
+echo 65536 > /proc/sys/vm/mmap_min_addr               # Prevent NULL page mapping (null deref exploits)
+# Kernel instrumentation (no business running in production):
+echo 0 > /proc/sys/kernel/ftrace_enabled             # Disable function tracer
+echo 0 > /proc/sys/kernel/stack_tracer_enabled       # Disable stack depth tracer
+# Network hardening:
+echo 1 > /proc/sys/net/ipv4/conf/all/rp_filter            # Strict reverse path filtering
+echo 1 > /proc/sys/net/ipv4/conf/default/rp_filter
+echo 0 > /proc/sys/net/ipv4/conf/all/accept_redirects     # Ignore ICMP redirects
+echo 0 > /proc/sys/net/ipv4/conf/default/accept_redirects
+echo 0 > /proc/sys/net/ipv6/conf/all/accept_redirects
+echo 0 > /proc/sys/net/ipv6/conf/default/accept_redirects
+echo 0 > /proc/sys/net/ipv4/conf/all/send_redirects       # Don't send ICMP redirects
+echo 0 > /proc/sys/net/ipv4/conf/default/send_redirects
+echo 0 > /proc/sys/net/ipv4/conf/all/accept_source_route  # Reject source-routed packets
+echo 0 > /proc/sys/net/ipv4/conf/default/accept_source_route
+echo 0 > /proc/sys/net/ipv6/conf/all/accept_source_route
+echo 0 > /proc/sys/net/ipv6/conf/default/accept_source_route
+echo 1 > /proc/sys/net/ipv4/tcp_syncookies                # SYN flood protection
+echo 0 > /proc/sys/net/ipv6/conf/all/accept_ra            # Ignore Router Advertisements
+echo 0 > /proc/sys/net/ipv6/conf/default/accept_ra
+echo fq_codel > /proc/sys/net/core/default_qdisc          # Fair queuing + bufferbloat control (Fedora default)
+# Fedora sysctl.d defaults we inherit:
+echo 4194304 > /proc/sys/kernel/pid_max                    # Larger PID space (Fedora 50-pid-max.conf)
+
+#####################################################################
+# Finally, exec stage1
 exec /bin/stage1
 
-# Shutdown
+#####################################################################
+# Oops! FUBAR! Shutdown!
+#
 echo "[ERROR] Failed to run stage1"
 $BB sleep 2
 $BB poweroff -f
